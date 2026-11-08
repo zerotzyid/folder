@@ -243,6 +243,451 @@ fi
 cp -a "$SOURCE_DIR/." "$PTERO_DIR/resources/"
 ok "File tema disalin."
 
+# Repo tema mengimpor 3 komponen yang tidak ada di repo (DashboardTopBar,
+# QuickHubCards, DashboardActivityWidget) -> build webpack gagal "Module not found".
+# Dibuat otomatis hanya jika file belum ada.
+ensure_missing_components() {
+  local DASH_DIR="$PTERO_DIR/resources/scripts/components/dashboard"
+  mkdir -p "$DASH_DIR"
+  if [ ! -f "$DASH_DIR/DashboardTopBar.tsx" ]; then
+    cat > "$DASH_DIR/DashboardTopBar.tsx" <<'ESPRESSO_EOF_DashboardTopBar'
+import React from 'react';
+import { Link } from 'react-router-dom';
+import styled from 'styled-components/macro';
+import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
+import { faBars, faSearch, faTimes } from '@fortawesome/free-solid-svg-icons';
+
+interface Props {
+    searchQuery: string;
+    onSearchChange: (value: string) => void;
+    onOpenMobile: () => void;
+}
+
+const Bar = styled.header`
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 24px;
+    background-color: rgba(20, 18, 17, 0.92);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid rgba(139, 120, 109, 0.15);
+    box-sizing: border-box;
+
+    @media (max-width: 640px) {
+        padding: 12px 14px;
+    }
+`;
+
+const MenuButton = styled.button`
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 38px;
+    height: 38px;
+    border-radius: 10px;
+    border: 1px solid rgba(191, 168, 158, 0.25);
+    background: #1c1917;
+    color: #bfa89e;
+    cursor: pointer;
+
+    &:hover {
+        color: #ebf5ee;
+        border-color: rgba(191, 168, 158, 0.5);
+    }
+
+    @media (min-width: 1024px) {
+        display: none;
+    }
+`;
+
+const SearchWrap = styled.div`
+    position: relative;
+    flex: 1;
+    max-width: 460px;
+
+    & > svg.icon-left {
+        position: absolute;
+        left: 12px;
+        top: 50%;
+        transform: translateY(-50%);
+        color: #8b786d;
+        font-size: 13px;
+        pointer-events: none;
+    }
+`;
+
+const SearchInput = styled.input`
+    width: 100%;
+    box-sizing: border-box;
+    height: 38px;
+    padding: 0 34px 0 34px;
+    border-radius: 10px;
+    border: 1px solid rgba(191, 168, 158, 0.2);
+    background: #1c1917;
+    color: #ebf5ee;
+    font-family: 'Outfit', sans-serif;
+    font-size: 13.5px;
+    outline: none;
+    transition: border-color 0.15s ease;
+
+    &::placeholder {
+        color: #8b786d;
+    }
+
+    &:focus {
+        border-color: rgba(191, 168, 158, 0.55);
+    }
+`;
+
+const ClearButton = styled.button`
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    border: 0;
+    background: transparent;
+    color: #8b786d;
+    cursor: pointer;
+    padding: 4px;
+
+    &:hover {
+        color: #ebf5ee;
+    }
+`;
+
+const Spacer = styled.div`
+    flex: 1;
+`;
+
+const AccountLink = styled(Link)`
+    font-family: 'Outfit', sans-serif;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: #bfa89e;
+    text-decoration: none;
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: 1px solid rgba(191, 168, 158, 0.2);
+    background: #1c1917;
+    white-space: nowrap;
+
+    &:hover {
+        color: #ebf5ee;
+        border-color: rgba(191, 168, 158, 0.45);
+    }
+
+    @media (max-width: 640px) {
+        display: none;
+    }
+`;
+
+export default ({ searchQuery, onSearchChange, onOpenMobile }: Props) => (
+    <Bar>
+        <MenuButton type={'button'} aria-label={'Open menu'} onClick={onOpenMobile}>
+            <FontAwesomeIcon icon={faBars} />
+        </MenuButton>
+        <SearchWrap>
+            <FontAwesomeIcon icon={faSearch} className={'icon-left'} />
+            <SearchInput
+                type={'text'}
+                value={searchQuery}
+                placeholder={'Search servers...'}
+                onChange={(e) => onSearchChange(e.target.value)}
+            />
+            {searchQuery !== '' && (
+                <ClearButton type={'button'} aria-label={'Clear search'} onClick={() => onSearchChange('')}>
+                    <FontAwesomeIcon icon={faTimes} />
+                </ClearButton>
+            )}
+        </SearchWrap>
+        <Spacer />
+        <AccountLink to={'/account'}>My account</AccountLink>
+    </Bar>
+);
+ESPRESSO_EOF_DashboardTopBar
+    info "Komponen hilang dibuat: DashboardTopBar.tsx"
+  fi
+  if [ ! -f "$DASH_DIR/QuickHubCards.tsx" ]; then
+    cat > "$DASH_DIR/QuickHubCards.tsx" <<'ESPRESSO_EOF_QuickHubCards'
+import React from 'react';
+import { Link } from 'react-router-dom';
+import styled from 'styled-components/macro';
+import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
+import {
+    faKey,
+    faTerminal,
+    faHistory,
+    faComments,
+    faServer,
+    faCreditCard,
+    faLifeRing,
+    faGlobe,
+} from '@fortawesome/free-solid-svg-icons';
+
+const Grid = styled.div`
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+
+    @media (min-width: 768px) {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+
+    @media (min-width: 1280px) {
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    }
+`;
+
+const cardStyles = `
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 16px;
+    border-radius: 12px;
+    background-color: #1c1917;
+    border: 1px solid rgba(191, 168, 158, 0.18);
+    text-decoration: none;
+    transition: transform 0.15s ease, border-color 0.15s ease;
+
+    &:hover {
+        transform: translateY(-2px);
+        border-color: rgba(191, 168, 158, 0.45);
+    }
+`;
+
+const InternalCard = styled(Link)`
+    ${cardStyles}
+`;
+
+const ExternalCard = styled.a`
+    ${cardStyles}
+`;
+
+const IconBox = styled.span`
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    min-width: 34px;
+    border-radius: 9px;
+    background: #25211e;
+    color: #bfa89e;
+    font-size: 14px;
+`;
+
+const Label = styled.span`
+    font-family: 'Outfit', sans-serif;
+    font-size: 13.5px;
+    font-weight: 600;
+    color: #ebf5ee;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+`;
+
+export default () => {
+    const hub = (window as any).SiteConfiguration?.hubLinks;
+
+    const internal = [
+        { to: '/account/api', title: 'API Keys', icon: faKey },
+        { to: '/account/ssh', title: 'SSH Keys', icon: faTerminal },
+        { to: '/account/activity', title: 'Activity', icon: faHistory },
+    ];
+
+    const external = [
+        {
+            key: 'discord',
+            title: 'Discord',
+            icon: faComments,
+            enabled: hub?.discord ? !!hub.discord.enabled : false,
+            url: hub?.discord?.url || '',
+        },
+        {
+            key: 'status',
+            title: 'Nodes Status',
+            icon: faServer,
+            enabled: hub?.status ? !!hub.status.enabled : false,
+            url: hub?.status?.url || '',
+        },
+        {
+            key: 'billing',
+            title: 'Billing',
+            icon: faCreditCard,
+            enabled: hub?.billing ? !!hub.billing.enabled : false,
+            url: hub?.billing?.url || '',
+        },
+        {
+            key: 'support',
+            title: 'Support',
+            icon: faLifeRing,
+            enabled: hub?.support ? !!hub.support.enabled : false,
+            url: hub?.support?.url || '',
+        },
+        {
+            key: 'custom',
+            title: hub?.custom?.title || 'Website',
+            icon: faGlobe,
+            enabled: hub?.custom ? !!hub.custom.enabled : false,
+            url: hub?.custom?.url || '',
+        },
+    ].filter((l) => l.enabled && l.url);
+
+    return (
+        <Grid>
+            {internal.map((item) => (
+                <InternalCard key={item.to} to={item.to}>
+                    <IconBox>
+                        <FontAwesomeIcon icon={item.icon} />
+                    </IconBox>
+                    <Label>{item.title}</Label>
+                </InternalCard>
+            ))}
+            {external.map((item) => (
+                <ExternalCard key={item.key} href={item.url} target={'_blank'} rel={'noreferrer'}>
+                    <IconBox>
+                        <FontAwesomeIcon icon={item.icon} />
+                    </IconBox>
+                    <Label>{item.title}</Label>
+                </ExternalCard>
+            ))}
+        </Grid>
+    );
+};
+ESPRESSO_EOF_QuickHubCards
+    info "Komponen hilang dibuat: QuickHubCards.tsx"
+  fi
+  if [ ! -f "$DASH_DIR/DashboardActivityWidget.tsx" ]; then
+    cat > "$DASH_DIR/DashboardActivityWidget.tsx" <<'ESPRESSO_EOF_DashboardActivityWidget'
+import React from 'react';
+import { Link } from 'react-router-dom';
+import styled from 'styled-components/macro';
+import useSWR from 'swr';
+import http from '@/api/http';
+
+interface ActivityItem {
+    id: string;
+    event: string;
+    timestamp: string;
+    ip: string | null;
+}
+
+const Card = styled.div`
+    background-color: #1c1917;
+    border: 1px solid rgba(191, 168, 158, 0.18);
+    border-radius: 12px;
+    padding: 16px;
+    font-family: 'Outfit', sans-serif;
+`;
+
+const Header = styled.div`
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+
+    & h3 {
+        margin: 0;
+        font-size: 15px;
+        font-weight: 700;
+        color: #ebf5ee;
+    }
+
+    & a {
+        font-size: 12px;
+        font-weight: 600;
+        color: #bfa89e;
+        text-decoration: none;
+    }
+
+    & a:hover {
+        color: #ebf5ee;
+    }
+`;
+
+const Row = styled.div`
+    padding: 10px 0;
+    border-top: 1px solid rgba(139, 120, 109, 0.15);
+
+    &:first-of-type {
+        border-top: 0;
+    }
+`;
+
+const EventName = styled.p`
+    margin: 0;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: #ebf5ee;
+    word-break: break-word;
+`;
+
+const Meta = styled.p`
+    margin: 2px 0 0 0;
+    font-size: 11.5px;
+    color: #8b786d;
+`;
+
+const Empty = styled.p`
+    margin: 0;
+    font-size: 13px;
+    color: #8b786d;
+`;
+
+export default () => {
+    const { data, error } = useSWR<ActivityItem[]>(
+        'dashboard-activity-widget',
+        () =>
+            http
+                .get('/api/client/account/activity', { params: { per_page: 5, sort: '-timestamp' } })
+                .then(({ data }) =>
+                    ((data && data.data) || []).map((item: any) => ({
+                        id: String(item.attributes.id || item.attributes.timestamp),
+                        event: String(item.attributes.event),
+                        timestamp: String(item.attributes.timestamp),
+                        ip: item.attributes.ip || null,
+                    }))
+                ),
+        { revalidateOnFocus: false }
+    );
+
+    return (
+        <Card>
+            <Header>
+                <h3>Recent activity</h3>
+                <Link to={'/account/activity'}>View all</Link>
+            </Header>
+            {error ? (
+                <Empty>Unable to load activity.</Empty>
+            ) : !data ? (
+                <Empty>Loading...</Empty>
+            ) : data.length === 0 ? (
+                <Empty>No recent activity.</Empty>
+            ) : (
+                data.map((item) => (
+                    <Row key={item.id}>
+                        <EventName>{item.event}</EventName>
+                        <Meta>
+                            {new Date(item.timestamp).toLocaleString()}
+                            {item.ip ? ` · ${item.ip}` : ''}
+                        </Meta>
+                    </Row>
+                ))
+            )}
+        </Card>
+    );
+};
+ESPRESSO_EOF_DashboardActivityWidget
+    info "Komponen hilang dibuat: DashboardActivityWidget.tsx"
+  fi
+}
+ensure_missing_components
+ok "Komponen tema diperiksa."
+
 # ---------- Build ----------
 step "Build aset production (1-5 menit)"
 
