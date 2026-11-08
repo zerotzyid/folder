@@ -18,7 +18,7 @@ set -Eeuo pipefail
 # ---------- Konfigurasi ----------
 PTERO_DIR="${PTERO_DIR:-/var/www/pterodactyl}"
 REPO_TARBALL="https://github.com/suzirz/pterodactyl-espresso-theme/archive/refs/heads/main.tar.gz"
-NODE_MAJOR_TARGET=20
+NODE_MAJOR_TARGET=20   # default; otomatis dinaikkan sesuai "engines.node" di package.json panel
 NODE_MIN_MAJOR=16
 LOG_FILE="/tmp/espresso-install-$(date +%Y%m%d_%H%M%S).log"
 TOTAL_STEPS=6
@@ -142,6 +142,15 @@ done
 step "Memeriksa Node.js"
 
 node_major() { node -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/'; }
+
+# Baca versi Node minimal dari package.json panel (contoh: ">=22" -> 22)
+REQ_MAJOR="$(grep -A3 '"engines"' "$PTERO_DIR/package.json" 2>/dev/null \
+  | grep -oE '"node"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -oE '[0-9]+' | head -n1 || true)"
+if [ -n "${REQ_MAJOR:-}" ]; then
+  info "Panel meminta Node.js >= ${REQ_MAJOR}."
+  if [ "$REQ_MAJOR" -gt "$NODE_MIN_MAJOR" ]; then NODE_MIN_MAJOR="$REQ_MAJOR"; fi
+  if [ "$REQ_MAJOR" -gt "$NODE_MAJOR_TARGET" ]; then NODE_MAJOR_TARGET="$REQ_MAJOR"; fi
+fi
 
 install_node() {
   export DEBIAN_FRONTEND=noninteractive
