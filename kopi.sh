@@ -1,745 +1,479 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# Espresso Cockpit - Pterodactyl Panel Theme Installer (fixed)
-# GitHub : https://github.com/suzirz/pterodactyl-espresso-theme
-# Support: Ubuntu 20.04 / 22.04 / 24.04 / 26.04 (dan Debian-based lain)
+# =====================================================================
+#  SODIUM PANEL AUTO INSTALLER  (TUI edition)
+#  Panel : https://github.com/sodiumpanel/panel
+#  Daemon: https://github.com/zt3xdv/sodium-reaction
 #
-# Perbaikan:
-#  - Yarn palsu dari paket apt "cmdtest" (penyebab error "no scenarios" /
-#    "no such option: --frozen-lockfile") dihapus, diganti Yarn asli.
-#  - Node.js otomatis dipasang/diupgrade (minimal v16, default v20).
-#  - NODE_OPTIONS=--openssl-legacy-provider untuk webpack 4 di Node 17+.
-#  - Rollback otomatis dari backup jika build gagal.
-#  - Tampilan baru (step, spinner, log file).
-# ==============================================================================
-
+#  Interaktif : sudo bash sodium-installer.sh
+#  Non-interaktif:
+#    sudo bash sodium-installer.sh full
+#    sudo bash sodium-installer.sh panel --dev
+#    sudo bash sodium-installer.sh addnode --panel-url https://panel.domain.com \
+#         --admin-user admin --admin-pass 'RAHASIA' --node-name node-2
+# =====================================================================
 set -Eeuo pipefail
+export LC_ALL="${LC_ALL:-C.UTF-8}" 2>/dev/null || true
 
-# ---------- Konfigurasi ----------
-PTERO_DIR="${PTERO_DIR:-/var/www/pterodactyl}"
-REPO_TARBALL="https://github.com/suzirz/pterodactyl-espresso-theme/archive/refs/heads/main.tar.gz"
-NODE_MAJOR_TARGET=20   # default; otomatis dinaikkan sesuai "engines.node" di package.json panel
-NODE_MIN_MAJOR=16
-LOG_FILE="/tmp/espresso-install-$(date +%Y%m%d_%H%M%S).log"
-TOTAL_STEPS=6
+# ---------- default ----------
+MODE="${1:-}"; [[ $# -gt 0 ]] && shift || true
+BASE_DIR="/opt/sodium"; PANEL_DIR="$BASE_DIR/panel"; DAEMON_DIR="$BASE_DIR/reaction"
+PANEL_REPO="https://github.com/sodiumpanel/panel.git"
+DAEMON_REPO="https://github.com/zt3xdv/sodium-reaction.git"
+PANEL_PORT="${PANEL_PORT:-3000}"; PANEL_URL=""; PANEL_PUBLIC=""
+ADMIN_USER="${ADMIN_USER:-admin}"; ADMIN_PASS="${ADMIN_PASS:-}"; ADMIN_EMAIL="${ADMIN_EMAIL:-admin@localhost.local}"
+NODE_NAME="${NODE_NAME:-node-$(hostname -s)}"; NODE_FQDN=""
+DAEMON_PORT="${DAEMON_PORT:-8080}"; SFTP_PORT="${SFTP_PORT:-2022}"
+DEV=0; INTERACTIVE=0
+LOG="/var/log/sodium-installer.log"; ROUTES="/tmp/sodium-routes.txt"
+TOKEN=""; RESP_BODY=""; RESP_CODE=""; NODE_ID=""; NODE_TOKEN=""; NODES_PATH=""; NODE_RAW=""; USED_PATH=""
+STEP_NOW=0; STEP_TOTAL=1
+TTY=/dev/tty; [[ -r $TTY ]] || TTY=/dev/stdin
 
-# ---------- Warna ----------
-if [ -t 1 ]; then
-  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
-  C_RED=$'\033[1;31m'; C_GREEN=$'\033[1;32m'; C_YELLOW=$'\033[1;33m'
-  C_CYAN=$'\033[1;36m'; C_BROWN=$'\033[38;5;137m'
-else
-  C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_BROWN=""
-fi
-
-BACKUP_DIR=""
-TEMP_DIR=""
-STEP=0
-BUILD_STARTED=0
-
-# ---------- Helper tampilan ----------
-banner() {
-  clear 2>/dev/null || true
-  echo -e "${C_BROWN}"
-  echo "  ┌──────────────────────────────────────────────────────┐"
-  echo "  │                                                      │"
-  echo "  │   ☕  ESPRESSO COCKPIT  ·  Pterodactyl Theme         │"
-  echo "  │        Installer v2 (Ubuntu 20 / 22 / 24 / 26)       │"
-  echo "  │                                                      │"
-  echo "  └──────────────────────────────────────────────────────┘"
-  echo -e "${C_RESET}"
-}
-
-step()  { STEP=$((STEP+1)); echo -e "\n${C_CYAN}[${STEP}/${TOTAL_STEPS}]${C_RESET} ${C_BOLD}$*${C_RESET}"; }
-ok()    { echo -e "  ${C_GREEN}✔${C_RESET} $*"; }
-info()  { echo -e "  ${C_DIM}•${C_RESET} $*"; }
-warn()  { echo -e "  ${C_YELLOW}⚠${C_RESET} $*"; }
-fail()  { echo -e "\n  ${C_RED}✘ ERROR:${C_RESET} $*" >&2; echo -e "  ${C_DIM}Log lengkap: ${LOG_FILE}${C_RESET}" >&2; exit 1; }
-
-# Jalankan perintah di background dengan spinner, output ke log
-run() {
-  local msg="$1"; shift
-  local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0
-  echo -e "\n>>> $msg\n>>> $*" >> "$LOG_FILE"
-  "$@" >> "$LOG_FILE" 2>&1 &
-  local pid=$!
-  if [ -t 1 ]; then
-    while kill -0 "$pid" 2>/dev/null; do
-      printf "\r  ${C_CYAN}%s${C_RESET} %s" "${spin:i++%${#spin}:1}" "$msg"
-      sleep 0.1
-    done
-    printf "\r\033[K"
-  fi
-  if wait "$pid"; then
-    ok "$msg"
-  else
-    echo -e "  ${C_RED}✘${C_RESET} $msg"
-    echo -e "${C_DIM}--- 25 baris terakhir log ---${C_RESET}" >&2
-    tail -n 25 "$LOG_FILE" >&2
-    return 1
-  fi
-}
-
-# ---------- Cleanup & rollback ----------
-cleanup() {
-  [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ] && rm -rf "$TEMP_DIR"
-  return 0
-}
-
-on_error() {
-  local code=$?
-  trap - ERR
-  echo -e "\n  ${C_RED}✘ Instalasi gagal (kode $code).${C_RESET}" >&2
-  if [ "$BUILD_STARTED" = "1" ] && [ -n "$BACKUP_DIR" ] && [ -d "$BACKUP_DIR/resources" ]; then
-    warn "Mengembalikan file asli dari backup..."
-    rm -rf "$PTERO_DIR/resources"
-    cp -a "$BACKUP_DIR/resources" "$PTERO_DIR/resources" && ok "Resources dikembalikan ke kondisi semula."
-  fi
-  echo -e "  ${C_DIM}Log lengkap: ${LOG_FILE}${C_RESET}" >&2
-  cleanup
-  exit "$code"
-}
-trap on_error ERR
-trap cleanup EXIT
-
-# ---------- Pengecekan awal ----------
-banner
-
-[ "${EUID:-$(id -u)}" -eq 0 ] || fail "Jalankan sebagai root (sudo -i)."
-: > "$LOG_FILE"
-
-step "Memeriksa sistem"
-
-OS_ID=""; OS_VER=""
-if [ -r /etc/os-release ]; then
-  # shellcheck disable=SC1091
-  . /etc/os-release
-  OS_ID="${ID:-}"; OS_VER="${VERSION_ID:-}"
-fi
-
-case "$OS_ID" in
-  ubuntu)
-    case "$OS_VER" in
-      20.04|22.04|24.04|26.04) ok "Ubuntu $OS_VER didukung." ;;
-      *) warn "Ubuntu $OS_VER tidak ada di daftar resmi (20.04/22.04/24.04/26.04), tetap dilanjutkan." ;;
-    esac ;;
-  debian) ok "Debian $OS_VER terdeteksi (kompatibel)." ;;
-  *) warn "OS '$OS_ID' tidak diuji, tetap dilanjutkan." ;;
-esac
-
-[ -d "$PTERO_DIR" ] || fail "Direktori Pterodactyl tidak ditemukan di $PTERO_DIR."
-[ -f "$PTERO_DIR/package.json" ] || fail "$PTERO_DIR/package.json tidak ada. Apakah ini panel Pterodactyl?"
-ok "Panel ditemukan di $PTERO_DIR"
-
-for bin in curl tar; do
-  command -v "$bin" >/dev/null 2>&1 || {
-    info "Memasang $bin..."
-    run "apt-get install $bin" apt-get install -y "$bin" || fail "Gagal memasang $bin."
-  }
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dev) DEV=1;;
+    --panel-url) PANEL_URL="${2%/}"; shift;;
+    --admin-user) ADMIN_USER="$2"; shift;;
+    --admin-pass) ADMIN_PASS="$2"; shift;;
+    --admin-email) ADMIN_EMAIL="$2"; shift;;
+    --node-name) NODE_NAME="$2"; shift;;
+    --node-fqdn) NODE_FQDN="$2"; shift;;
+    --port) PANEL_PORT="$2"; shift;;
+    --daemon-port) DAEMON_PORT="$2"; shift;;
+    *) echo "Opsi tidak dikenal: $1"; exit 1;;
+  esac; shift
 done
 
-# ---------- Node.js ----------
-step "Memeriksa Node.js"
+# =====================================================================
+#  TUI
+# =====================================================================
+W=64
+R=$'\e[0m'; B=$'\e[1m'; D=$'\e[2m'
+c(){ printf '\e[38;5;%sm' "$1"; }
+ACC=$(c 45); OK=$(c 82); ERR=$(c 203); WRN=$(c 221); MUT=$(c 245); PUR=$(c 141)
+HIDE=$'\e[?25l'; SHOW=$'\e[?25h'
+restore(){ printf '%s' "$SHOW$R"; }
+trap restore EXIT
 
-node_major() { node -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/'; }
+strip(){ sed -E $'s/\x1b\\[[0-9;?]*[a-zA-Z]//g'; }
+vlen(){ printf '%s' "$1" | strip | LC_ALL=C tr -d '\200-\277' | wc -c | tr -d ' '; }
+rep(){ local n=$1 ch=$2 out="" i; for ((i=0;i<n;i++)); do out+="$ch"; done; printf '%s' "$out"; }
 
-# Baca versi Node minimal dari package.json panel (contoh: ">=22" -> 22)
-REQ_MAJOR="$(grep -A3 '"engines"' "$PTERO_DIR/package.json" 2>/dev/null \
-  | grep -oE '"node"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -oE '[0-9]+' | head -n1 || true)"
-if [ -n "${REQ_MAJOR:-}" ]; then
-  info "Panel meminta Node.js >= ${REQ_MAJOR}."
-  if [ "$REQ_MAJOR" -gt "$NODE_MIN_MAJOR" ]; then NODE_MIN_MAJOR="$REQ_MAJOR"; fi
-  if [ "$REQ_MAJOR" -gt "$NODE_MAJOR_TARGET" ]; then NODE_MAJOR_TARGET="$REQ_MAJOR"; fi
-fi
-
-install_node() {
-  export DEBIAN_FRONTEND=noninteractive
-  run "apt-get update" apt-get update -y || true
-  run "Memasang prasyarat (ca-certificates, gnupg)" apt-get install -y ca-certificates curl gnupg || return 1
-  mkdir -p /etc/apt/keyrings
-  run "Mengunduh GPG key NodeSource" bash -c \
-    "curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg" || return 1
-  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR_TARGET}.x nodistro main" \
-    > /etc/apt/sources.list.d/nodesource.list
-  run "apt-get update (NodeSource)" apt-get update -y || return 1
-  run "Memasang Node.js ${NODE_MAJOR_TARGET}.x" apt-get install -y nodejs || return 1
+banner(){
+  clear 2>/dev/null || printf '\e[2J\e[H'
+  local cols=(51 45 39 33 27 63) i=0 line
+  while IFS= read -r line; do
+    printf '  %s%s%s\n' "$B$(c "${cols[$i]}")" "$line" "$R"; i=$((i+1))
+  done <<'EOF'
+ ____   ___  ____ ___ _   _ __  __
+/ ___| / _ \|  _ \_ _| | | |  \/  |
+\___ \| | | | | | | || | | | |\/| |
+ ___) | |_| | |_| | || |_| | |  | |
+|____/ \___/|____/___|\___/|_|  |_|
+EOF
+  printf '  %s%s%s\n' "$MUT" "Auto Installer  ·  Panel  ·  Node  ·  Multi-VPS" "$R"
+  printf '  %s%s%s\n\n' "$D$MUT" "$(rep $((W-2)) '─')" "$R"
 }
 
-if ! command -v node >/dev/null 2>&1; then
-  warn "Node.js belum terpasang, memasang v${NODE_MAJOR_TARGET}..."
-  install_node || fail "Gagal memasang Node.js."
-elif [ "$(node_major)" -lt "$NODE_MIN_MAJOR" ]; then
-  warn "Node.js $(node -v) terlalu lama (minimal v${NODE_MIN_MAJOR}), upgrade ke v${NODE_MAJOR_TARGET}..."
-  install_node || fail "Gagal upgrade Node.js."
-fi
-hash -r
-ok "Node.js $(node -v) siap."
-
-# ---------- Yarn (perbaikan utama) ----------
-step "Memeriksa Yarn"
-
-# Yarn yang valid mengeluarkan versi seperti 1.22.22 / 3.x / 4.x.
-yarn_ok() {
-  command -v yarn >/dev/null 2>&1 || return 1
-  local v
-  v="$(yarn --version 2>/dev/null | head -n1 || true)"
-  [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]
+# kotak: box "Judul" warna baris1 baris2 ...
+box(){
+  local title=$1 col=$2; shift 2
+  local inner=$((W-2)) t="─ $title "
+  local tl; tl=$(vlen "$t")
+  printf '  %s╭%s%s%s╮%s\n' "$col" "$t" "$(rep $((inner-tl)) '─')" "" "$R"
+  local l pad
+  for l in "$@"; do
+    pad=$((inner-2-$(vlen "$l"))); ((pad<0)) && pad=0
+    printf '  %s│%s %s%*s %s│%s\n' "$col" "$R" "$l" "$pad" "" "$col" "$R"
+  done
+  printf '  %s╰%s╯%s\n' "$col" "$(rep $inner '─')" "$R"
 }
 
-if ! yarn_ok; then
-  if command -v yarn >/dev/null 2>&1; then
-    warn "Binary 'yarn' ($(command -v yarn)) bukan Yarn asli (kemungkinan paket apt 'cmdtest')."
+log(){ printf '[%s] %s\n' "$(date +%T)" "$*" >>"$LOG"; }
+say(){  log "$*"; printf '  %s›%s %s\n' "$ACC" "$R" "$*"; }
+ok(){   log "OK $*"; printf '  %s✔%s %s\n' "$OK" "$R" "$*"; }
+warn(){ log "WARN $*"; printf '  %s!%s %s%s%s\n' "$WRN" "$R" "$WRN" "$*" "$R"; }
+die(){  log "FATAL $*"; printf '\n'; box "GAGAL" "$ERR" "$*" "" "${MUT}Log lengkap: $LOG${R}"; exit 1; }
+trap 'die "Error di baris $LINENO (lihat log)."' ERR
+
+# progress bar langkah
+step(){
+  STEP_NOW=$((STEP_NOW+1))
+  local w=24 f=$(( STEP_NOW*24/STEP_TOTAL )) bar
+  bar="$ACC$(rep $f '█')$MUT$(rep $((w-f)) '░')$R"
+  printf '\n  %s[%s%s]%s %s%d/%d%s  %s%s%s\n' "$MUT" "$R" "$bar" "$MUT" "$B" "$STEP_NOW" "$STEP_TOTAL" "$R" "$B" "$1" "$R"
+  log "STEP $STEP_NOW/$STEP_TOTAL $1"
+}
+
+SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+# run "pesan" cmd... : jalankan di background dengan spinner, output ke log
+run(){
+  local msg=$1; shift
+  "$@" >>"$LOG" 2>&1 & local pid=$! i=0 t0=$SECONDS
+  printf '%s' "$HIDE"
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r  %s%s%s %s %s(%ds)%s\e[K' "$ACC" "${SPIN[i%10]}" "$R" "$msg" "$MUT" $((SECONDS-t0)) "$R"
+    i=$((i+1)); sleep 0.1
+  done
+  if wait "$pid"; then printf '\r  %s✔%s %s %s(%ds)%s\e[K\n' "$OK" "$R" "$msg" "$MUT" $((SECONDS-t0)) "$R"
   else
-    info "Yarn belum terpasang."
+    printf '\r  %s✘%s %s\e[K\n' "$ERR" "$R" "$msg"; printf '%s' "$SHOW"
+    echo; tail -n 12 "$LOG" | sed "s/^/    ${MUT}│ /;s/\$/${R}/"; die "Langkah gagal: $msg"
   fi
-
-  if dpkg -s cmdtest >/dev/null 2>&1; then
-    run "Menghapus paket 'cmdtest' (yarn palsu)" apt-get remove -y cmdtest || fail "Gagal menghapus cmdtest."
-  fi
-  if dpkg -s yarn >/dev/null 2>&1 && ! yarn_ok; then
-    run "Menghapus paket apt 'yarn' yang rusak" apt-get remove -y yarn || true
-  fi
-  hash -r
-
-  run "Memasang Yarn asli via npm" npm install -g --force yarn || fail "Gagal memasang Yarn via npm."
-  hash -r
-fi
-
-yarn_ok || fail "Yarn masih tidak valid setelah perbaikan. Cek: which -a yarn"
-ok "Yarn $(yarn --version | head -n1) siap ($(command -v yarn))."
-
-# ---------- Backup ----------
-step "Membuat backup"
-
-BACKUP_DIR="$PTERO_DIR/.espresso-theme-backup/$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$BACKUP_DIR"
-if [ -d "$PTERO_DIR/resources" ]; then
-  cp -a "$PTERO_DIR/resources" "$BACKUP_DIR/"
-  ok "Backup disimpan di $BACKUP_DIR"
-else
-  fail "Folder $PTERO_DIR/resources tidak ada."
-fi
-
-# ---------- Ambil & terapkan tema ----------
-step "Menerapkan file tema"
-
-SCRIPT_SRC="${BASH_SOURCE[0]:-}"
-SOURCE_DIR=""
-if [ -n "$SCRIPT_SRC" ] && [ -f "$SCRIPT_SRC" ]; then
-  LOCAL_ROOT="$(cd "$(dirname "$SCRIPT_SRC")/.." 2>/dev/null && pwd || true)"
-  [ -n "$LOCAL_ROOT" ] && [ -d "$LOCAL_ROOT/resources" ] && SOURCE_DIR="$LOCAL_ROOT/resources"
-fi
-
-if [ -z "$SOURCE_DIR" ]; then
-  TEMP_DIR="$(mktemp -d /tmp/espresso-theme.XXXXXX)"
-  info "Mengunduh tema terbaru dari GitHub..."
-  run "Download & ekstrak tema" bash -c \
-    "curl -fsSL '$REPO_TARBALL' | tar -xz -C '$TEMP_DIR' --strip-components=1" \
-    || fail "Gagal mengunduh tema. Cek koneksi ke github.com."
-  SOURCE_DIR="$TEMP_DIR/resources"
-fi
-
-[ -d "$SOURCE_DIR" ] || fail "Folder resources tema tidak ditemukan di $SOURCE_DIR."
-cp -a "$SOURCE_DIR/." "$PTERO_DIR/resources/"
-ok "File tema disalin."
-
-# Repo tema mengimpor 3 komponen yang tidak ada di repo (DashboardTopBar,
-# QuickHubCards, DashboardActivityWidget) -> build webpack gagal "Module not found".
-# Dibuat otomatis hanya jika file belum ada.
-ensure_missing_components() {
-  local DASH_DIR="$PTERO_DIR/resources/scripts/components/dashboard"
-  mkdir -p "$DASH_DIR"
-  if [ ! -f "$DASH_DIR/DashboardTopBar.tsx" ]; then
-    cat > "$DASH_DIR/DashboardTopBar.tsx" <<'ESPRESSO_EOF_DashboardTopBar'
-import React from 'react';
-import { Link } from 'react-router-dom';
-import styled from 'styled-components/macro';
-import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { faBars, faSearch, faTimes } from '@fortawesome/free-solid-svg-icons';
-
-interface Props {
-    searchQuery: string;
-    onSearchChange: (value: string) => void;
-    onOpenMobile: () => void;
+  printf '%s' "$SHOW"
+}
+# poll "pesan" detik cmd... : ulangi cmd tiap 1 dtk dengan spinner (foreground)
+poll(){
+  local msg=$1 secs=$2; shift 2; local i=0 n
+  printf '%s' "$HIDE"
+  for ((n=0;n<secs;n++)); do
+    if "$@" >/dev/null 2>&1; then printf '\r  %s✔%s %s\e[K\n' "$OK" "$R" "$msg"; printf '%s' "$SHOW"; return 0; fi
+    for _ in 1 2 3 4 5 6 7 8 9 10; do printf '\r  %s%s%s %s %s(%ds)%s\e[K' "$ACC" "${SPIN[i%10]}" "$R" "$msg" "$MUT" "$n" "$R"; i=$((i+1)); sleep 0.1; done
+  done
+  printf '\r  %s✘%s %s\e[K\n' "$ERR" "$R" "$msg"; printf '%s' "$SHOW"; return 1
 }
 
-const Bar = styled.header`
-    position: sticky;
-    top: 0;
-    z-index: 30;
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 14px 24px;
-    background-color: rgba(20, 18, 17, 0.92);
-    backdrop-filter: blur(8px);
-    border-bottom: 1px solid rgba(139, 120, 109, 0.15);
-    box-sizing: border-box;
-
-    @media (max-width: 640px) {
-        padding: 12px 14px;
-    }
-`;
-
-const MenuButton = styled.button`
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 38px;
-    height: 38px;
-    border-radius: 10px;
-    border: 1px solid rgba(191, 168, 158, 0.25);
-    background: #1c1917;
-    color: #bfa89e;
-    cursor: pointer;
-
-    &:hover {
-        color: #ebf5ee;
-        border-color: rgba(191, 168, 158, 0.5);
-    }
-
-    @media (min-width: 1024px) {
-        display: none;
-    }
-`;
-
-const SearchWrap = styled.div`
-    position: relative;
-    flex: 1;
-    max-width: 460px;
-
-    & > svg.icon-left {
-        position: absolute;
-        left: 12px;
-        top: 50%;
-        transform: translateY(-50%);
-        color: #8b786d;
-        font-size: 13px;
-        pointer-events: none;
-    }
-`;
-
-const SearchInput = styled.input`
-    width: 100%;
-    box-sizing: border-box;
-    height: 38px;
-    padding: 0 34px 0 34px;
-    border-radius: 10px;
-    border: 1px solid rgba(191, 168, 158, 0.2);
-    background: #1c1917;
-    color: #ebf5ee;
-    font-family: 'Outfit', sans-serif;
-    font-size: 13.5px;
-    outline: none;
-    transition: border-color 0.15s ease;
-
-    &::placeholder {
-        color: #8b786d;
-    }
-
-    &:focus {
-        border-color: rgba(191, 168, 158, 0.55);
-    }
-`;
-
-const ClearButton = styled.button`
-    position: absolute;
-    right: 8px;
-    top: 50%;
-    transform: translateY(-50%);
-    border: 0;
-    background: transparent;
-    color: #8b786d;
-    cursor: pointer;
-    padding: 4px;
-
-    &:hover {
-        color: #ebf5ee;
-    }
-`;
-
-const Spacer = styled.div`
-    flex: 1;
-`;
-
-const AccountLink = styled(Link)`
-    font-family: 'Outfit', sans-serif;
-    font-size: 12.5px;
-    font-weight: 600;
-    color: #bfa89e;
-    text-decoration: none;
-    padding: 8px 12px;
-    border-radius: 8px;
-    border: 1px solid rgba(191, 168, 158, 0.2);
-    background: #1c1917;
-    white-space: nowrap;
-
-    &:hover {
-        color: #ebf5ee;
-        border-color: rgba(191, 168, 158, 0.45);
-    }
-
-    @media (max-width: 640px) {
-        display: none;
-    }
-`;
-
-export default ({ searchQuery, onSearchChange, onOpenMobile }: Props) => (
-    <Bar>
-        <MenuButton type={'button'} aria-label={'Open menu'} onClick={onOpenMobile}>
-            <FontAwesomeIcon icon={faBars} />
-        </MenuButton>
-        <SearchWrap>
-            <FontAwesomeIcon icon={faSearch} className={'icon-left'} />
-            <SearchInput
-                type={'text'}
-                value={searchQuery}
-                placeholder={'Search servers...'}
-                onChange={(e) => onSearchChange(e.target.value)}
-            />
-            {searchQuery !== '' && (
-                <ClearButton type={'button'} aria-label={'Clear search'} onClick={() => onSearchChange('')}>
-                    <FontAwesomeIcon icon={faTimes} />
-                </ClearButton>
-            )}
-        </SearchWrap>
-        <Spacer />
-        <AccountLink to={'/account'}>My account</AccountLink>
-    </Bar>
-);
-ESPRESSO_EOF_DashboardTopBar
-    info "Komponen hilang dibuat: DashboardTopBar.tsx"
-  fi
-  if [ ! -f "$DASH_DIR/QuickHubCards.tsx" ]; then
-    cat > "$DASH_DIR/QuickHubCards.tsx" <<'ESPRESSO_EOF_QuickHubCards'
-import React from 'react';
-import { Link } from 'react-router-dom';
-import styled from 'styled-components/macro';
-import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import {
-    faKey,
-    faTerminal,
-    faHistory,
-    faComments,
-    faServer,
-    faCreditCard,
-    faLifeRing,
-    faGlobe,
-} from '@fortawesome/free-solid-svg-icons';
-
-const Grid = styled.div`
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 12px;
-    margin-bottom: 24px;
-
-    @media (min-width: 768px) {
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-    }
-
-    @media (min-width: 1280px) {
-        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-    }
-`;
-
-const cardStyles = `
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 14px 16px;
-    border-radius: 12px;
-    background-color: #1c1917;
-    border: 1px solid rgba(191, 168, 158, 0.18);
-    text-decoration: none;
-    transition: transform 0.15s ease, border-color 0.15s ease;
-
-    &:hover {
-        transform: translateY(-2px);
-        border-color: rgba(191, 168, 158, 0.45);
-    }
-`;
-
-const InternalCard = styled(Link)`
-    ${cardStyles}
-`;
-
-const ExternalCard = styled.a`
-    ${cardStyles}
-`;
-
-const IconBox = styled.span`
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 34px;
-    height: 34px;
-    min-width: 34px;
-    border-radius: 9px;
-    background: #25211e;
-    color: #bfa89e;
-    font-size: 14px;
-`;
-
-const Label = styled.span`
-    font-family: 'Outfit', sans-serif;
-    font-size: 13.5px;
-    font-weight: 600;
-    color: #ebf5ee;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-`;
-
-export default () => {
-    const hub = (window as any).SiteConfiguration?.hubLinks;
-
-    const internal = [
-        { to: '/account/api', title: 'API Keys', icon: faKey },
-        { to: '/account/ssh', title: 'SSH Keys', icon: faTerminal },
-        { to: '/account/activity', title: 'Activity', icon: faHistory },
-    ];
-
-    const external = [
-        {
-            key: 'discord',
-            title: 'Discord',
-            icon: faComments,
-            enabled: hub?.discord ? !!hub.discord.enabled : false,
-            url: hub?.discord?.url || '',
-        },
-        {
-            key: 'status',
-            title: 'Nodes Status',
-            icon: faServer,
-            enabled: hub?.status ? !!hub.status.enabled : false,
-            url: hub?.status?.url || '',
-        },
-        {
-            key: 'billing',
-            title: 'Billing',
-            icon: faCreditCard,
-            enabled: hub?.billing ? !!hub.billing.enabled : false,
-            url: hub?.billing?.url || '',
-        },
-        {
-            key: 'support',
-            title: 'Support',
-            icon: faLifeRing,
-            enabled: hub?.support ? !!hub.support.enabled : false,
-            url: hub?.support?.url || '',
-        },
-        {
-            key: 'custom',
-            title: hub?.custom?.title || 'Website',
-            icon: faGlobe,
-            enabled: hub?.custom ? !!hub.custom.enabled : false,
-            url: hub?.custom?.url || '',
-        },
-    ].filter((l) => l.enabled && l.url);
-
-    return (
-        <Grid>
-            {internal.map((item) => (
-                <InternalCard key={item.to} to={item.to}>
-                    <IconBox>
-                        <FontAwesomeIcon icon={item.icon} />
-                    </IconBox>
-                    <Label>{item.title}</Label>
-                </InternalCard>
-            ))}
-            {external.map((item) => (
-                <ExternalCard key={item.key} href={item.url} target={'_blank'} rel={'noreferrer'}>
-                    <IconBox>
-                        <FontAwesomeIcon icon={item.icon} />
-                    </IconBox>
-                    <Label>{item.title}</Label>
-                </ExternalCard>
-            ))}
-        </Grid>
-    );
-};
-ESPRESSO_EOF_QuickHubCards
-    info "Komponen hilang dibuat: QuickHubCards.tsx"
-  fi
-  if [ ! -f "$DASH_DIR/DashboardActivityWidget.tsx" ]; then
-    cat > "$DASH_DIR/DashboardActivityWidget.tsx" <<'ESPRESSO_EOF_DashboardActivityWidget'
-import React from 'react';
-import { Link } from 'react-router-dom';
-import styled from 'styled-components/macro';
-import useSWR from 'swr';
-import http from '@/api/http';
-
-interface ActivityItem {
-    id: string;
-    event: string;
-    timestamp: string;
-    ip: string | null;
+# menu "Judul" opsi... -> MENU_IDX
+menu(){
+  local title=$1; shift; local opts=("$@") sel=0 n=$# key rest i
+  printf '%s' "$HIDE"
+  printf '  %s%s%s\n' "$B" "$title" "$R"
+  while true; do
+    for ((i=0;i<n;i++)); do
+      if ((i==sel)); then printf '   %s❯ %s%s%s\e[K\n' "$ACC" "$B" "${opts[i]}" "$R"
+      else printf '     %s%s%s\e[K\n' "$MUT" "${opts[i]}" "$R"; fi
+    done
+    IFS= read -rsn1 key <"$TTY" || true
+    if [[ $key == $'\e' ]]; then read -rsn2 -t 0.1 rest <"$TTY" || true; key=$rest; fi
+    case "$key" in
+      '[A'|k) ((sel=(sel+n-1)%n));;
+      '[B'|j) ((sel=(sel+1)%n));;
+      ''|$'\n') break;;
+      [1-9]) ((key<=n)) && { sel=$((key-1)); break; };;
+    esac
+    printf '\e[%dA' "$n"
+  done
+  printf '%s' "$SHOW"; MENU_IDX=$sel
+}
+# ask "Label" "default" [secret]  -> ASK_RES
+ask(){
+  local label=$1 def=${2:-} secret=${3:-} v=""
+  printf '  %s?%s %s%s%s %s' "$PUR" "$R" "$B" "$label" "$R" "$MUT${def:+[$def] }$R"
+  if [[ $secret == secret ]]; then read -rs v <"$TTY" || true; echo; else read -r v <"$TTY" || true; fi
+  ASK_RES=${v:-$def}
 }
 
-const Card = styled.div`
-    background-color: #1c1917;
-    border: 1px solid rgba(191, 168, 158, 0.18);
-    border-radius: 12px;
-    padding: 16px;
-    font-family: 'Outfit', sans-serif;
-`;
-
-const Header = styled.div`
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 12px;
-
-    & h3 {
-        margin: 0;
-        font-size: 15px;
-        font-weight: 700;
-        color: #ebf5ee;
-    }
-
-    & a {
-        font-size: 12px;
-        font-weight: 600;
-        color: #bfa89e;
-        text-decoration: none;
-    }
-
-    & a:hover {
-        color: #ebf5ee;
-    }
-`;
-
-const Row = styled.div`
-    padding: 10px 0;
-    border-top: 1px solid rgba(139, 120, 109, 0.15);
-
-    &:first-of-type {
-        border-top: 0;
-    }
-`;
-
-const EventName = styled.p`
-    margin: 0;
-    font-size: 12.5px;
-    font-weight: 600;
-    color: #ebf5ee;
-    word-break: break-word;
-`;
-
-const Meta = styled.p`
-    margin: 2px 0 0 0;
-    font-size: 11.5px;
-    color: #8b786d;
-`;
-
-const Empty = styled.p`
-    margin: 0;
-    font-size: 13px;
-    color: #8b786d;
-`;
-
-export default () => {
-    const { data, error } = useSWR<ActivityItem[]>(
-        'dashboard-activity-widget',
-        () =>
-            http
-                .get('/api/client/account/activity', { params: { per_page: 5, sort: '-timestamp' } })
-                .then(({ data }) =>
-                    ((data && data.data) || []).map((item: any) => ({
-                        id: String(item.attributes.id || item.attributes.timestamp),
-                        event: String(item.attributes.event),
-                        timestamp: String(item.attributes.timestamp),
-                        ip: item.attributes.ip || null,
-                    }))
-                ),
-        { revalidateOnFocus: false }
-    );
-
-    return (
-        <Card>
-            <Header>
-                <h3>Recent activity</h3>
-                <Link to={'/account/activity'}>View all</Link>
-            </Header>
-            {error ? (
-                <Empty>Unable to load activity.</Empty>
-            ) : !data ? (
-                <Empty>Loading...</Empty>
-            ) : data.length === 0 ? (
-                <Empty>No recent activity.</Empty>
-            ) : (
-                data.map((item) => (
-                    <Row key={item.id}>
-                        <EventName>{item.event}</EventName>
-                        <Meta>
-                            {new Date(item.timestamp).toLocaleString()}
-                            {item.ip ? ` · ${item.ip}` : ''}
-                        </Meta>
-                    </Row>
-                ))
-            )}
-        </Card>
-    );
-};
-ESPRESSO_EOF_DashboardActivityWidget
-    info "Komponen hilang dibuat: DashboardActivityWidget.tsx"
+interactive_wizard(){
+  INTERACTIVE=1; banner
+  menu "Pilih yang ingin dipasang:" \
+    "1  Panel + Node (VPS ini)      — paling cepat, node langsung hijau" \
+    "2  Panel saja                   — hosting / dev lokal" \
+    "3  Node saja (VPS ini)          — daftar ke panel yang sudah ada" \
+    "4  Tambah Node dari VPS lain    — jalankan di VPS yang berbeda"
+  case $MENU_IDX in 0) MODE=full;; 1) MODE=panel;; 2) MODE=node;; 3) MODE=addnode;; esac
+  echo
+  if [[ $MODE == full || $MODE == panel ]]; then
+    menu "Tipe deployment:" "1  Hosting / Production (systemd, auto-start saat boot)" "2  Dev / Server lokal (npm start)"
+    DEV=$MENU_IDX; echo
+    ask "Port panel" "$PANEL_PORT"; PANEL_PORT=$ASK_RES
+    ask "Username admin" "$ADMIN_USER"; ADMIN_USER=$ASK_RES
+    ask "Password admin (kosong = acak)" "" secret; ADMIN_PASS=$ASK_RES
   fi
+  if [[ $MODE == node || $MODE == addnode ]]; then
+    ask "URL panel (contoh https://panel.domain.com)" "$PANEL_URL"; PANEL_URL=${ASK_RES%/}
+    ask "Username admin panel" "$ADMIN_USER"; ADMIN_USER=$ASK_RES
+    ask "Password admin panel" "" secret; ADMIN_PASS=$ASK_RES
+  fi
+  if [[ $MODE != panel ]]; then
+    ask "Nama node" "$NODE_NAME"; NODE_NAME=$ASK_RES
+    ask "FQDN/IP node (kosong = deteksi otomatis)" ""; NODE_FQDN=$ASK_RES
+  fi
+  echo
+  box "Ringkasan" "$ACC" \
+    "Mode       : ${B}$MODE${R}" \
+    "Panel port : $PANEL_PORT   ${MUT}(dev=$DEV)${R}" \
+    "Admin      : $ADMIN_USER" \
+    "Node       : $NODE_NAME" "" "${MUT}Tekan Enter untuk mulai, Ctrl+C untuk batal${R}"
+  read -r _ <"$TTY" || true
 }
-ensure_missing_components
-ok "Komponen tema diperiksa."
 
-# ---------- Build ----------
-step "Build aset production (1-5 menit)"
+[[ $EUID -eq 0 ]] || { echo "Jalankan sebagai root: sudo bash $0"; exit 1; }
+mkdir -p "$BASE_DIR"; : > "$LOG"
+if [[ -z $MODE ]]; then interactive_wizard; else banner; fi
 
-BUILD_STARTED=1
-cd "$PTERO_DIR"
+# =====================================================================
+#  Sistem
+# =====================================================================
+detect_pm(){
+  if command -v apt-get >/dev/null; then PM=apt
+  elif command -v dnf >/dev/null; then PM=dnf
+  elif command -v yum >/dev/null; then PM=yum
+  else die "Package manager tidak didukung (butuh apt/dnf/yum)"; fi
+}
+pkg(){ if [[ $PM == apt ]]; then DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"; else "$PM" install -y -q "$@"; fi; }
+public_ip(){
+  [[ -n ${_PIP:-} ]] && { echo "$_PIP"; return; }
+  local ip=""
+  for u in https://api.ipify.org https://ifconfig.me https://icanhazip.com; do
+    ip=$(curl -fsS -m 6 "$u" 2>/dev/null | tr -d '[:space:]') && [[ $ip =~ ^[0-9a-fA-F:.]+$ ]] && break || ip=""
+  done
+  [[ -n $ip ]] || ip=$(hostname -I | awk '{print $1}')
+  _PIP=$ip; echo "$ip"
+}
+rand(){ head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c "${1:-20}"; }
 
-# Webpack 4 (Pterodactyl 1.x) butuh ini di Node >= 17
-if [ "$(node_major)" -ge 17 ]; then
-  export NODE_OPTIONS="--openssl-legacy-provider ${NODE_OPTIONS:-}"
-  info "NODE_OPTIONS=--openssl-legacy-provider diaktifkan (Node $(node -v))."
+do_base(){
+  [[ $PM == apt ]] && apt-get update -qq
+  pkg curl git jq ca-certificates tar gzip openssl
+  if [[ $PM == apt ]]; then pkg build-essential python3; else pkg gcc gcc-c++ make python3; fi
+}
+do_node(){
+  if [[ $PM == apt ]]; then curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  else curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -; fi
+  pkg nodejs
+}
+have_node(){ command -v node >/dev/null && [[ $(node -v | tr -dc '0-9.' | cut -d. -f1) -ge 18 ]]; }
+do_docker(){ curl -fsSL https://get.docker.com | sh; systemctl enable --now docker || true; }
+do_go(){
+  local arch v; arch=$(uname -m); [[ $arch == x86_64 ]] && arch=amd64; [[ $arch == aarch64 ]] && arch=arm64
+  v=$(curl -fsS "https://go.dev/VERSION?m=text" | head -1)
+  curl -fsSL "https://go.dev/dl/${v}.linux-${arch}.tar.gz" | tar -C /usr/local -xz
+  ln -sf /usr/local/go/bin/go /usr/local/bin/go
+}
+open_ports(){
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q active; then for p in "$@"; do ufw allow "$p" >>"$LOG" 2>&1 || true; done; fi
+  if command -v firewall-cmd >/dev/null; then for p in "$@"; do firewall-cmd --permanent --add-port="$p/tcp" >>"$LOG" 2>&1 || true; done; firewall-cmd --reload >>"$LOG" 2>&1 || true; fi
+}
+clone(){ if [[ -d "$2/.git" ]]; then git -C "$2" pull --ff-only || true; else git clone --depth 1 "$1" "$2"; fi; }
+
+# =====================================================================
+#  HTTP helper
+# =====================================================================
+call(){
+  local m=$1 p=$2 d=${3:-} out
+  local a=(-sS -m 40 -X "$m" -H 'Content-Type: application/json' -w $'\n%{http_code}')
+  [[ -n $TOKEN ]] && a+=(-H "Authorization: Bearer $TOKEN" -H "X-API-Key: $TOKEN")
+  [[ -n $d ]] && a+=(-d "$d")
+  out=$(curl "${a[@]}" "$PANEL_URL$p" 2>/dev/null) || { RESP_CODE=000; RESP_BODY=""; return 1; }
+  RESP_CODE=${out##*$'\n'}; RESP_BODY=${out%$'\n'*}
+  [[ $RESP_CODE =~ ^2 ]]
+}
+first_ok(){ local m=$1 d=$2; shift 2; for p in "$@"; do call "$m" "$p" "$d" && { USED_PATH=$p; return 0; }; done; return 1; }
+http_up(){ curl -sS -m 3 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null | grep -qE '^[1-4]'; }
+
+discover_routes(){
+  : > "$ROUTES"; [[ -d $PANEL_DIR ]] || return 0
+  grep -rhoE "(app|router|r|api|admin)\.(get|post|put|patch|delete|use)\(\s*['\"\`][^'\"\`]+" \
+    --include=*.js --include=*.mjs --include=*.ts "$PANEL_DIR" --exclude-dir=node_modules --exclude-dir=public 2>/dev/null \
+    | sed -E "s/.*\(\s*['\"\`]//" | sort -u > "$ROUTES" || true
+  ok "Route API terdeteksi otomatis: ${B}$(wc -l < "$ROUTES")${R}"
+}
+routes_like(){ grep -iE "$1" "$ROUTES" 2>/dev/null | grep -v ':' | head -8 || true; }
+
+# =====================================================================
+#  Panel
+# =====================================================================
+panel_fetch(){ clone "$PANEL_REPO" "$PANEL_DIR"; cd "$PANEL_DIR"; npm install --no-audit --no-fund; npm run build; }
+panel_start(){
+  PANEL_URL="http://127.0.0.1:$PANEL_PORT"
+  if [[ $DEV -eq 1 ]]; then
+    (cd "$PANEL_DIR" && PORT=$PANEL_PORT nohup npm start >"$BASE_DIR/panel.out" 2>&1 &)
+    ok "Mode DEV: ${B}npm start${R} berjalan di background (log: $BASE_DIR/panel.out)"
+  else
+    cat >/etc/systemd/system/sodium-panel.service <<EOF
+[Unit]
+Description=Sodium Panel
+After=network.target
+[Service]
+WorkingDirectory=$PANEL_DIR
+Environment=PORT=$PANEL_PORT
+ExecStart=$(command -v npm) start
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload; systemctl enable --now sodium-panel >>"$LOG" 2>&1
+    ok "Service systemd ${B}sodium-panel${R} aktif"
+  fi
+  open_ports "$PANEL_PORT"
+  poll "Menunggu panel merespon di port $PANEL_PORT" 90 http_up "$PANEL_URL" || die "Panel tidak merespon. Cek $BASE_DIR/panel.out / journalctl -u sodium-panel"
+}
+wizard_done(){ [[ -f $PANEL_DIR/data/config.json ]]; }
+setup_panel_admin(){
+  [[ -z $ADMIN_PASS ]] && ADMIN_PASS=$(rand 16) && GEN_PASS=1
+  if wizard_done; then ok "Panel sudah ter-setup (data/config.json ada)"; return; fi
+  say "Mencoba setup wizard otomatis lewat API..."
+  local body url; url="http://$(public_ip):$PANEL_PORT"
+  body=$(jq -nc --arg u "$ADMIN_USER" --arg e "$ADMIN_EMAIL" --arg p "$ADMIN_PASS" --arg url "$url" --argjson port "$PANEL_PORT" \
+    '{panelName:"Sodium",name:"Sodium",url:$url,panelUrl:$url,port:$port,database:{type:"file"},db:{type:"file"},redis:{enabled:false},
+      limits:{servers:0,memory:0,disk:0,cpu:0},defaultLimits:{servers:0,memory:0,disk:0,cpu:0},
+      admin:{username:$u,email:$e,password:$p},username:$u,email:$e,password:$p}')
+  local cands=($(routes_like 'setup') /api/setup /api/setup/complete /api/setup/finish /setup)
+  if first_ok POST "$body" "${cands[@]}"; then ok "Setup selesai via ${B}$USED_PATH${R}"; sleep 3; return; fi
+  echo
+  box "Selesaikan wizard di browser" "$WRN" \
+    "Buka : ${B}$url${R}" "Pilih DB ${B}File${R}, buat akun admin." "" "${MUT}Script menunggu otomatis...${R}"
+  poll "Menunggu wizard selesai (data/config.json)" 1800 wizard_done || die "Wizard belum selesai"
+  ask "Username admin yang Anda buat" "$ADMIN_USER"; ADMIN_USER=$ASK_RES
+  ask "Password admin" "" secret; ADMIN_PASS=$ASK_RES; GEN_PASS=0; sleep 3
+}
+panel_login(){
+  local paths=($(routes_like 'login') /api/auth/login /api/login /api/v1/auth/login /auth/login) b
+  local bodies=(
+    "$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" '{username:$u,password:$p}')"
+    "$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" '{email:$u,password:$p}')"
+    "$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" '{login:$u,password:$p}')")
+  for b in "${bodies[@]}"; do
+    if first_ok POST "$b" "${paths[@]}"; then
+      TOKEN=$(echo "$RESP_BODY" | jq -r '.token // .accessToken // .access_token // .jwt // .data.token // .data.accessToken // empty')
+      [[ -n $TOKEN ]] && { ok "Login admin berhasil"; return; }
+    fi
+  done
+  die "Login gagal. Cek username/password admin atau URL panel."
+}
+
+# =====================================================================
+#  Node + Daemon
+# =====================================================================
+create_node(){
+  NODE_FQDN="${NODE_FQDN:-$(public_ip)}"
+  local paths=($(routes_like 'node') /api/admin/nodes /api/nodes /api/admin/node) loc="" lp
+  for lp in $(routes_like 'location') /api/admin/locations /api/locations; do
+    if call GET "$lp"; then loc=$(echo "$RESP_BODY" | jq -r '(.[0] // .locations[0] // .data[0] // empty) | (.id // .uuid // empty)' 2>/dev/null || true); [[ -n $loc ]] && break; fi
+  done
+  if [[ -z $loc ]]; then
+    for lp in /api/admin/locations /api/locations; do
+      if call POST "$lp" '{"name":"Default","short":"default","description":"Default"}'; then
+        loc=$(echo "$RESP_BODY" | jq -r '.id // .uuid // .location.id // .data.id // empty'); [[ -n $loc ]] && break; fi
+    done
+  fi
+  local trial m d o body
+  for trial in "0 0 -1" "999999999 999999999 0"; do
+    read -r m d o <<<"$trial"
+    body=$(jq -nc --arg n "$NODE_NAME" --arg f "$NODE_FQDN" --arg loc "$loc" \
+      --argjson m "$m" --argjson d "$d" --argjson o "$o" --argjson dp "$DAEMON_PORT" --argjson sp "$SFTP_PORT" \
+      '{name:$n,fqdn:$f,host:$f,address:$f,ip:$f,scheme:"http",port:$dp,daemonPort:$dp,daemonListen:$dp,daemonSftp:$sp,sftpPort:$sp,
+        memory:$m,disk:$d,memoryOverallocate:$o,diskOverallocate:$o,overallocate:$o,cpu:0,public:true,maintenanceMode:false,
+        locationId:(if $loc=="" then null else $loc end),location:(if $loc=="" then null else $loc end),location_id:(if $loc=="" then null else $loc end)}')
+    if first_ok POST "$body" "${paths[@]}"; then
+      NODES_PATH=${USED_PATH%/}
+      NODE_ID=$(echo "$RESP_BODY" | jq -r '.id // .uuid // .node.id // .data.id // .node.uuid // empty')
+      NODE_TOKEN=$(echo "$RESP_BODY" | jq -r '.token // .daemonToken // .daemon_token // .node.token // .data.token // empty')
+      NODE_RAW="$RESP_BODY"
+      [[ -n $NODE_ID ]] && { ok "Node ${B}$NODE_NAME${R} dibuat  ${MUT}id=$NODE_ID · RAM/Disk unlimited${R}"; return; }
+    fi
+  done
+  die "Gagal membuat node. Respons ($RESP_CODE): ${RESP_BODY:0:200}"
+}
+fetch_daemon_config(){
+  mkdir -p /etc/sodium; local p
+  for p in config configuration config-yaml config.yml deploy; do
+    if call GET "$NODES_PATH/$NODE_ID/$p"; then printf '%s' "$RESP_BODY" > /etc/sodium/node-config.raw; ok "Config daemon diambil dari panel ${MUT}(/$p)${R}"; return 0; fi
+  done
+  if [[ -n $NODE_TOKEN ]]; then
+    jq -n --arg id "$NODE_ID" --arg t "$NODE_TOKEN" --arg u "$PANEL_PUBLIC" --argjson p "$DAEMON_PORT" --argjson s "$SFTP_PORT" \
+      '{uuid:$id,token:$t,panel:$u,remote:$u,api:{host:"0.0.0.0",port:$p},sftp:{port:$s}}' > /etc/sodium/node-config.raw
+    warn "Endpoint config tidak ada; memakai token dari pembuatan node"; return 0
+  fi
+  echo "$NODE_RAW" > /etc/sodium/node-config.raw; warn "Respons mentah disimpan di /etc/sodium/node-config.raw"
+}
+daemon_fetch(){
+  clone "$DAEMON_REPO" "$DAEMON_DIR"; cd "$DAEMON_DIR"
+  if [[ -f go.mod ]]; then command -v go >/dev/null || do_go; go build -o reaction .
+  elif [[ -f package.json ]]; then npm install --no-audit --no-fund; npm run build || true
+  else echo "Struktur repo daemon tidak dikenali"; return 1; fi
+}
+daemon_service(){
+  local start raw=/etc/sodium/node-config.raw ext=yml t
+  if [[ -f $DAEMON_DIR/go.mod ]]; then start="$DAEMON_DIR/reaction"; else start="$(command -v npm) start"; fi
+  head -c1 "$raw" | grep -q '[{[]' && ext=json
+  if [[ $ext == json ]]; then jq . "$raw" > /etc/sodium/config.json 2>/dev/null || cp "$raw" /etc/sodium/config.json; else cp "$raw" /etc/sodium/config.yml; fi
+  for t in "$DAEMON_DIR/config.$ext" "$DAEMON_DIR/config/config.$ext" "/etc/sodium-reaction/config.$ext"; do
+    mkdir -p "$(dirname "$t")"; cp "/etc/sodium/config.$ext" "$t"; done
+  cat >/etc/systemd/system/sodium-reaction.service <<EOF
+[Unit]
+Description=Sodium Reaction Daemon
+After=network.target docker.service
+Requires=docker.service
+[Service]
+WorkingDirectory=$DAEMON_DIR
+ExecStart=$start
+Restart=always
+RestartSec=3
+LimitNOFILE=4096000
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload; systemctl enable --now sodium-reaction >>"$LOG" 2>&1
+  open_ports "$DAEMON_PORT" "$SFTP_PORT"
+  ok "Service systemd ${B}sodium-reaction${R} aktif"
+}
+node_green(){
+  call GET "$NODES_PATH/$NODE_ID" && echo "$RESP_BODY" | grep -qiE '"(online|connected|alive)"[[:space:]]*:[[:space:]]*true|"status"[[:space:]]*:[[:space:]]*"(online|connected|ready|running)"'
+}
+wait_green(){
+  if poll "Menunggu node hijau (online)" 180 node_green; then NODE_STATE="${OK}● ONLINE (hijau)${R}"
+  else NODE_STATE="${WRN}● belum terdeteksi online${R}"
+    warn "Cek: journalctl -u sodium-reaction -n 50 --no-pager  · pastikan port $DAEMON_PORT terbuka dari panel"; fi
+}
+
+summary(){
+  echo; local l=()
+  if [[ $MODE == panel || $MODE == full ]]; then
+    l+=("Panel   : ${B}http://$(public_ip):$PANEL_PORT${R}" "Admin   : ${B}$ADMIN_USER${R}   Pass: ${B}$ADMIN_PASS${R}")
+  fi
+  [[ -n $NODE_ID ]] && l+=("Node    : ${B}$NODE_NAME${R} ($NODE_FQDN)" "Status  : ${NODE_STATE:-}" "Resource: RAM ∞  ·  Disk ∞")
+  l+=("" "${MUT}Log     : $LOG${R}")
+  [[ $MODE == panel || $MODE == full ]] && l+=("${MUT}Service : systemctl status sodium-panel${R}")
+  [[ -n $NODE_ID ]] && l+=("${MUT}Daemon  : systemctl status sodium-reaction${R}")
+  box "✔ INSTALASI SELESAI" "$OK" "${l[@]}"
+  [[ ${GEN_PASS:-0} == 1 ]] && echo -e "\n  ${WRN}Simpan password admin di atas — dibuat acak dan hanya tampil sekali.${R}"
+  echo
+}
+
+# =====================================================================
+#  Alur
+# =====================================================================
+case "$MODE" in
+  full)    STEP_TOTAL=8;;
+  panel)   STEP_TOTAL=4;;
+  node)    STEP_TOTAL=5;;
+  addnode) STEP_TOTAL=5;;
+  *) die "Mode salah. Pakai: panel | node | full | addnode";;
+esac
+if [[ $MODE == node || $MODE == addnode ]]; then
+  [[ -n $PANEL_URL ]] || { [[ $MODE == node ]] && PANEL_URL="http://127.0.0.1:$PANEL_PORT" || die "Butuh --panel-url"; }
+  [[ -n $ADMIN_PASS ]] || die "Butuh --admin-pass"
 fi
+box "Mode: $MODE" "$MUT" "Host : $(hostname)   IP: $(public_ip)" "OS   : $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-linux}")"
+detect_pm
 
-if [ -f yarn.lock ]; then
-  run "yarn install (frozen lockfile)" yarn install --frozen-lockfile \
-    || run "yarn install (fallback)" yarn install \
-    || fail "yarn install gagal."
-else
-  run "yarn install" yarn install || fail "yarn install gagal."
+step "Paket dasar & Node.js"
+run "Memasang paket dasar (curl, git, jq, build tools)" do_base
+if have_node; then ok "Node.js $(node -v) sudah ada"; else run "Memasang Node.js 20 LTS" do_node; fi
+
+if [[ $MODE == full || $MODE == panel ]]; then
+  step "Mengunduh & build Sodium Panel"
+  run "Clone + npm install + build panel" panel_fetch
+  discover_routes
+  step "Menjalankan panel"
+  panel_start
+  step "Setup admin panel"
+  setup_panel_admin
 fi
+if [[ $MODE == full ]]; then PANEL_PUBLIC="http://$(public_ip):$PANEL_PORT"; fi
+if [[ $MODE == node || $MODE == addnode ]]; then PANEL_PUBLIC="$PANEL_URL"; fi
 
-if grep -q '"build:production"' package.json; then
-  run "yarn build:production" yarn build:production || fail "Build gagal."
-else
-  fail "Script 'build:production' tidak ada di package.json."
+if [[ $MODE != panel ]]; then
+  step "Login & membuat node"
+  panel_login; create_node
+  step "Memasang daemon (Docker + Sodium Reaction)"
+  if command -v docker >/dev/null; then ok "Docker sudah ada"; else run "Memasang Docker" do_docker; fi
+  run "Clone + build Sodium Reaction" daemon_fetch
+  step "Konfigurasi & start daemon"
+  fetch_daemon_config; daemon_service
+  step "Verifikasi node hijau"
+  wait_green
 fi
-BUILD_STARTED=0
-
-# ---------- Permission & cache ----------
-step "Permission & bersihkan cache"
-
-WEB_USER="www-data"
-id "$WEB_USER" >/dev/null 2>&1 || WEB_USER="nginx"
-id "$WEB_USER" >/dev/null 2>&1 || WEB_USER="apache"
-
-chown -R "$WEB_USER:$WEB_USER" "$PTERO_DIR" 2>/dev/null || warn "chown ke $WEB_USER gagal."
-chmod -R 755 "$PTERO_DIR/storage" "$PTERO_DIR/bootstrap/cache" 2>/dev/null || true
-ok "Permission diatur ($WEB_USER)."
-
-if command -v php >/dev/null 2>&1; then
-  php artisan view:clear   >> "$LOG_FILE" 2>&1 || true
-  php artisan config:clear >> "$LOG_FILE" 2>&1 || true
-  php artisan cache:clear  >> "$LOG_FILE" 2>&1 || true
-  ok "Cache Laravel dibersihkan."
-else
-  warn "PHP CLI tidak ditemukan, lewati clear cache."
-fi
-
-# ---------- Selesai ----------
-echo -e "\n${C_GREEN}  ┌──────────────────────────────────────────────────────┐"
-echo -e "  │   ✔  Espresso Cockpit berhasil dipasang!             │"
-echo -e "  └──────────────────────────────────────────────────────┘${C_RESET}"
-echo -e "  ${C_DIM}Refresh browser dengan Ctrl+F5 / Shift+Reload.${C_RESET}"
-echo -e "  ${C_DIM}Backup : ${BACKUP_DIR}${C_RESET}"
-echo -e "  ${C_DIM}Log    : ${LOG_FILE}${C_RESET}"
-echo -e "  ${C_DIM}Uninstall: bash <(curl -s https://raw.githubusercontent.com/suzirz/pterodactyl-espresso-theme/main/scripts/uninstall.sh)${C_RESET}\n"
+summary
