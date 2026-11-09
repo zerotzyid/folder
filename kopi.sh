@@ -19,13 +19,13 @@ MODE="${1:-}"; [[ $# -gt 0 ]] && shift || true
 BASE_DIR="/opt/sodium"; PANEL_DIR="$BASE_DIR/panel"; DAEMON_DIR="$BASE_DIR/reaction"
 PANEL_REPO="https://github.com/sodiumpanel/panel.git"
 DAEMON_REPO="https://github.com/zt3xdv/sodium-reaction.git"
-PANEL_PORT="${PANEL_PORT:-3000}"; PANEL_URL=""; PANEL_PUBLIC=""
+PANEL_PORT="${PANEL_PORT:-3000}"; PANEL_URL=""; PANEL_PUBLIC=""; PANEL_DOMAIN=""; NODE_SCHEME="http"; SSL_OK=0
 ADMIN_USER="${ADMIN_USER:-admin}"; ADMIN_PASS="${ADMIN_PASS:-}"; ADMIN_EMAIL="${ADMIN_EMAIL:-admin@localhost.local}"
 NODE_NAME="${NODE_NAME:-node-$(hostname -s)}"; NODE_FQDN=""
 DAEMON_PORT="${DAEMON_PORT:-8080}"; SFTP_PORT="${SFTP_PORT:-2022}"
 DEV=0; INTERACTIVE=0
 LOG="/var/log/sodium-installer.log"; ROUTES="/tmp/sodium-routes.txt"
-TOKEN=""; RESP_BODY=""; RESP_CODE=""; NODE_ID=""; NODE_TOKEN=""; NODES_PATH=""; NODE_RAW=""; USED_PATH=""
+TOKEN=""; RESP_BODY=""; RESP_CODE=""; NODE_ID=""; NODE_TOKEN=""; NODE_TOKEN_ID=""; NODE_STATE=""; GEN_PASS=0
 STEP_NOW=0; STEP_TOTAL=1
 TTY=/dev/tty; [[ -r $TTY ]] || TTY=/dev/stdin
 
@@ -33,6 +33,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --dev) DEV=1;;
     --panel-url) PANEL_URL="${2%/}"; shift;;
+    --panel-domain) PANEL_DOMAIN="$2"; shift;;
     --admin-user) ADMIN_USER="$2"; shift;;
     --admin-pass) ADMIN_PASS="$2"; shift;;
     --admin-email) ADMIN_EMAIL="$2"; shift;;
@@ -176,6 +177,7 @@ interactive_wizard(){
     menu "Tipe deployment:" "1  Hosting / Production (systemd, auto-start saat boot)" "2  Dev / Server lokal (npm start)"
     DEV=$MENU_IDX; echo
     ask "Port panel" "$PANEL_PORT"; PANEL_PORT=$ASK_RES
+    ask "Domain/FQDN panel (kosong = pakai IP:port)" "$PANEL_DOMAIN"; PANEL_DOMAIN=$ASK_RES
     ask "Username admin" "$ADMIN_USER"; ADMIN_USER=$ASK_RES
     ask "Password admin (kosong = acak)" "" secret; ADMIN_PASS=$ASK_RES
   fi
@@ -186,14 +188,16 @@ interactive_wizard(){
   fi
   if [[ $MODE != panel ]]; then
     ask "Nama node" "$NODE_NAME"; NODE_NAME=$ASK_RES
-    ask "FQDN/IP node (kosong = deteksi otomatis)" ""; NODE_FQDN=$ASK_RES
+    ask "Domain/FQDN node (kosong = pakai IP VPS ini)" "$NODE_FQDN"; NODE_FQDN=$ASK_RES
   fi
   echo
   box "Ringkasan" "$ACC" \
     "Mode       : ${B}$MODE${R}" \
     "Panel port : $PANEL_PORT   ${MUT}(dev=$DEV)${R}" \
+    "Panel FQDN : ${PANEL_DOMAIN:-${MUT}(IP:port)${R}}" \
     "Admin      : $ADMIN_USER" \
-    "Node       : $NODE_NAME" "" "${MUT}Tekan Enter untuk mulai, Ctrl+C untuk batal${R}"
+    "Node       : $NODE_NAME" \
+    "Node FQDN  : ${NODE_FQDN:-${MUT}(IP VPS)${R}}" "" "${MUT}Tekan Enter untuk mulai, Ctrl+C untuk batal${R}"
   read -r _ <"$TTY" || true
 }
 
@@ -246,41 +250,33 @@ open_ports(){
 }
 clone(){ if [[ -d "$2/.git" ]]; then git -C "$2" pull --ff-only || true; else git clone --depth 1 "$1" "$2"; fi; }
 
+is_ip(){ [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || $1 == *:* ]]; }
+dns_ok(){ local ip; ip=$(getent ahostsv4 "$1" 2>/dev/null | awk '{print $1; exit}'); [[ -n $ip && $ip == "$(public_ip)" ]]; }
+do_web(){ pkg nginx certbot python3-certbot-nginx; systemctl enable --now nginx || true; }
+do_certbot(){ pkg certbot; }
+
 # =====================================================================
-#  HTTP helper
+#  HTTP helper (API asli Sodium Panel)
 # =====================================================================
-call(){
+call(){ # METHOD PATH [JSON]
   local m=$1 p=$2 d=${3:-} out
   local a=(-sS -m 40 -X "$m" -H 'Content-Type: application/json' -w $'\n%{http_code}')
-  [[ -n $TOKEN ]] && a+=(-H "Authorization: Bearer $TOKEN" -H "X-API-Key: $TOKEN")
+  [[ -n $TOKEN ]] && a+=(-H "Authorization: Bearer $TOKEN")
   [[ -n $d ]] && a+=(-d "$d")
   out=$(curl "${a[@]}" "$PANEL_URL$p" 2>/dev/null) || { RESP_CODE=000; RESP_BODY=""; return 1; }
   RESP_CODE=${out##*$'\n'}; RESP_BODY=${out%$'\n'*}
   [[ $RESP_CODE =~ ^2 ]]
 }
-first_ok(){ local m=$1 d=$2; shift 2; for p in "$@"; do call "$m" "$p" "$d" && { USED_PATH=$p; return 0; }; done; return 1; }
 http_up(){ curl -sS -m 3 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null | grep -qE '^[1-4]'; }
-
-discover_routes(){
-  : > "$ROUTES"; [[ -d $PANEL_DIR ]] || return 0
-  grep -rhoE "(app|router|r|api|admin)\.(get|post|put|patch|delete|use)\(\s*['\"\`][^'\"\`]+" \
-    --include=*.js --include=*.mjs --include=*.ts "$PANEL_DIR" --exclude-dir=node_modules --exclude-dir=public 2>/dev/null \
-    | sed -E "s/.*\(\s*['\"\`]//" | sort -u > "$ROUTES" || true
-  ok "Route API terdeteksi otomatis: ${B}$(wc -l < "$ROUTES")${R}"
-}
-routes_like(){ grep -iE "$1" "$ROUTES" 2>/dev/null | grep -v ':' | head -8 || true; }
+panel_installed(){ curl -fsS -m 5 "$PANEL_URL/api/setup/status" 2>/dev/null | jq -e '.installed == true' >/dev/null; }
 
 # =====================================================================
 #  Panel
 # =====================================================================
 panel_fetch(){ clone "$PANEL_REPO" "$PANEL_DIR"; cd "$PANEL_DIR"; npm install --no-audit --no-fund; npm run build; }
-panel_start(){
-  PANEL_URL="http://127.0.0.1:$PANEL_PORT"
-  if [[ $DEV -eq 1 ]]; then
-    (cd "$PANEL_DIR" && PORT=$PANEL_PORT nohup npm start >"$BASE_DIR/panel.out" 2>&1 &)
-    ok "Mode DEV: ${B}npm start${R} berjalan di background (log: $BASE_DIR/panel.out)"
-  else
-    cat >/etc/systemd/system/sodium-panel.service <<EOF
+
+panel_unit(){
+  cat >/etc/systemd/system/sodium-panel.service <<EOF
 [Unit]
 Description=Sodium Panel
 After=network.target
@@ -293,142 +289,236 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload; systemctl enable --now sodium-panel >>"$LOG" 2>&1
-    ok "Service systemd ${B}sodium-panel${R} aktif"
+  systemctl daemon-reload
+}
+panel_run(){ # start / restart
+  if [[ $DEV -eq 1 ]]; then
+    [[ -f $BASE_DIR/panel.pid ]] && kill -- "-$(cat "$BASE_DIR/panel.pid")" 2>/dev/null || true
+    pkill -f "node src/server/index.js" 2>/dev/null || true; sleep 1
+    (cd "$PANEL_DIR" && PORT=$PANEL_PORT setsid nohup npm start >"$BASE_DIR/panel.out" 2>&1 & echo $! >"$BASE_DIR/panel.pid")
+  else
+    panel_unit; systemctl enable sodium-panel >>"$LOG" 2>&1; systemctl restart sodium-panel
   fi
+}
+panel_start(){
+  PANEL_URL="http://127.0.0.1:$PANEL_PORT"
+  panel_run
+  if [[ $DEV -eq 1 ]]; then ok "Mode DEV: ${B}npm start${R} berjalan di background (log: $BASE_DIR/panel.out)"
+  else ok "Service systemd ${B}sodium-panel${R} aktif"; fi
   open_ports "$PANEL_PORT"
   poll "Menunggu panel merespon di port $PANEL_PORT" 90 http_up "$PANEL_URL" || die "Panel tidak merespon. Cek $BASE_DIR/panel.out / journalctl -u sodium-panel"
 }
-wizard_done(){ [[ -f $PANEL_DIR/data/config.json ]]; }
-setup_panel_admin(){
-  [[ -z $ADMIN_PASS ]] && ADMIN_PASS=$(rand 16) && GEN_PASS=1
-  if wizard_done; then ok "Panel sudah ter-setup (data/config.json ada)"; return; fi
-  say "Mencoba setup wizard otomatis lewat API..."
-  local body url; url="http://$(public_ip):$PANEL_PORT"
-  body=$(jq -nc --arg u "$ADMIN_USER" --arg e "$ADMIN_EMAIL" --arg p "$ADMIN_PASS" --arg url "$url" --argjson port "$PANEL_PORT" \
-    '{panelName:"Sodium",name:"Sodium",url:$url,panelUrl:$url,port:$port,database:{type:"file"},db:{type:"file"},redis:{enabled:false},
-      limits:{servers:0,memory:0,disk:0,cpu:0},defaultLimits:{servers:0,memory:0,disk:0,cpu:0},
-      admin:{username:$u,email:$e,password:$p},username:$u,email:$e,password:$p}')
-  local cands=($(routes_like 'setup') /api/setup /api/setup/complete /api/setup/finish /setup)
-  if first_ok POST "$body" "${cands[@]}"; then ok "Setup selesai via ${B}$USED_PATH${R}"; sleep 3; return; fi
-  echo
-  box "Selesaikan wizard di browser" "$WRN" \
-    "Buka : ${B}$url${R}" "Pilih DB ${B}File${R}, buat akun admin." "" "${MUT}Script menunggu otomatis...${R}"
-  poll "Menunggu wizard selesai (data/config.json)" 1800 wizard_done || die "Wizard belum selesai"
-  ask "Username admin yang Anda buat" "$ADMIN_USER"; ADMIN_USER=$ASK_RES
-  ask "Password admin" "" secret; ADMIN_PASS=$ASK_RES; GEN_PASS=0; sleep 3
+
+# Domain panel: nginx reverse proxy (+ SSL Let's Encrypt jika DNS mengarah ke VPS ini)
+panel_domain_setup(){
+  PANEL_PUBLIC="http://$(public_ip):$PANEL_PORT"
+  [[ -n $PANEL_DOMAIN ]] || return 0
+  [[ $PM == apt ]] || { warn "Reverse proxy otomatis hanya untuk apt; domain panel dilewati"; return 0; }
+  run "Memasang nginx + certbot" do_web
+  cat >/etc/nginx/sites-available/sodium-panel <<'EOF'
+server {
+  listen 80;
+  server_name __DOMAIN__;
+  client_max_body_size 200m;
+  location / {
+    proxy_pass http://127.0.0.1:__PORT__;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 300s;
+  }
 }
+EOF
+  sed -i "s/__DOMAIN__/$PANEL_DOMAIN/;s/__PORT__/$PANEL_PORT/" /etc/nginx/sites-available/sodium-panel
+  ln -sf /etc/nginx/sites-available/sodium-panel /etc/nginx/sites-enabled/sodium-panel
+  rm -f /etc/nginx/sites-enabled/default
+  nginx -t >>"$LOG" 2>&1 && systemctl reload nginx >>"$LOG" 2>&1 || die "Konfigurasi nginx tidak valid (lihat log)"
+  open_ports 80 443
+  PANEL_PUBLIC="http://$PANEL_DOMAIN"
+  if dns_ok "$PANEL_DOMAIN"; then
+    if certbot --nginx -d "$PANEL_DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email --redirect >>"$LOG" 2>&1; then
+      PANEL_PUBLIC="https://$PANEL_DOMAIN"; ok "SSL aktif untuk ${B}$PANEL_DOMAIN${R}"
+    else warn "Certbot gagal untuk $PANEL_DOMAIN; panel tetap lewat HTTP"; fi
+  else
+    warn "DNS $PANEL_DOMAIN belum mengarah ke $(public_ip) (atau diproxy Cloudflare). SSL dilewati."
+  fi
+  ok "Panel via domain: ${B}$PANEL_PUBLIC${R}"
+}
+
+setup_panel_admin(){
+  if [[ -z $ADMIN_PASS ]]; then ADMIN_PASS=$(rand 16); GEN_PASS=1; fi
+  [[ $ADMIN_USER =~ ^[A-Za-z0-9_]{3,20}$ ]] || die "Username admin harus 3-20 karakter (huruf, angka, underscore)"
+  [[ ${#ADMIN_PASS} -ge 8 ]] || die "Password admin minimal 8 karakter"
+  if panel_installed; then ok "Panel sudah ter-setup sebelumnya (installed=true)"; return; fi
+  local body
+  body=$(jq -nc --arg url "$PANEL_PUBLIC" --argjson port "$PANEL_PORT" --arg u "$ADMIN_USER" --arg e "$ADMIN_EMAIL" --arg p "$ADMIN_PASS" \
+    '{panel:{name:"Sodium",url:$url,port:$port},database:{type:"file"},redis:{enabled:false},registration:{enabled:true},
+      defaults:{servers:999,memory:999999,disk:9999999,cpu:100000,allocations:999,backups:999},
+      admin:{username:$u,email:$e,password:$p}}')
+  say "Setup panel via API (/api/setup/complete)..."
+  call POST /api/setup/complete "$body" || die "Setup gagal ($RESP_CODE): ${RESP_BODY:0:200}"
+  ok "Wizard selesai & akun admin ${B}$ADMIN_USER${R} dibuat"
+  panel_run
+  poll "Memuat ulang panel dengan konfigurasi baru" 90 panel_installed || die "Panel belum 'installed' setelah restart"
+}
+
 panel_login(){
-  local paths=($(routes_like 'login') /api/auth/login /api/login /api/v1/auth/login /auth/login) b
-  local bodies=(
-    "$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" '{username:$u,password:$p}')"
-    "$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" '{email:$u,password:$p}')"
-    "$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" '{login:$u,password:$p}')")
-  for b in "${bodies[@]}"; do
-    if first_ok POST "$b" "${paths[@]}"; then
-      TOKEN=$(echo "$RESP_BODY" | jq -r '.token // .accessToken // .access_token // .jwt // .data.token // .data.accessToken // empty')
-      [[ -n $TOKEN ]] && { ok "Login admin berhasil"; return; }
-    fi
-  done
-  die "Login gagal. Cek username/password admin atau URL panel."
+  local body; body=$(jq -nc --arg u "$ADMIN_USER" --arg p "$ADMIN_PASS" '{username:$u,password:$p}')
+  call POST /api/auth/login "$body" || die "Login gagal ($RESP_CODE): $(echo "$RESP_BODY" | jq -r '.error // empty' 2>/dev/null)"
+  TOKEN=$(echo "$RESP_BODY" | jq -r '.token // empty')
+  if [[ -z $TOKEN ]]; then
+    echo "$RESP_BODY" | jq -e '.requires2FA' >/dev/null 2>&1 && die "Akun admin memakai 2FA email; matikan 2FA dulu lalu ulangi."
+    die "Login tidak mengembalikan token."
+  fi
+  ok "Login admin ${B}$ADMIN_USER${R} berhasil"
 }
 
 # =====================================================================
-#  Node + Daemon
+#  Node + Daemon (Sodium Reaction = fork Wings)
 # =====================================================================
+node_cert(){ # dapatkan SSL untuk FQDN node; set NODE_SCHEME
+  NODE_SCHEME=http; SSL_OK=0
+  is_ip "$NODE_FQDN" && return 0
+  if [[ -f /etc/letsencrypt/live/$NODE_FQDN/fullchain.pem ]]; then NODE_SCHEME=https; SSL_OK=1; ok "Memakai sertifikat SSL yang sudah ada untuk $NODE_FQDN"; return 0; fi
+  if ! dns_ok "$NODE_FQDN"; then warn "DNS $NODE_FQDN belum mengarah ke $(public_ip) (atau diproxy Cloudflare) → node pakai HTTP"; return 0; fi
+  [[ $PM == apt ]] || { warn "SSL otomatis hanya untuk apt → node pakai HTTP"; return 0; }
+  run "Memasang certbot" do_certbot
+  if certbot certonly --standalone -d "$NODE_FQDN" --non-interactive --agree-tos --register-unsafely-without-email \
+       --pre-hook "systemctl stop nginx || true" --post-hook "systemctl start nginx || true" >>"$LOG" 2>&1; then
+    NODE_SCHEME=https; SSL_OK=1; ok "SSL node aktif untuk ${B}$NODE_FQDN${R}"
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+    printf '#!/bin/sh\nsystemctl restart wings || true\n' >/etc/letsencrypt/renewal-hooks/deploy/wings.sh; chmod +x /etc/letsencrypt/renewal-hooks/deploy/wings.sh
+  else warn "Certbot gagal untuk $NODE_FQDN → node pakai HTTP"; fi
+}
+
 create_node(){
   NODE_FQDN="${NODE_FQDN:-$(public_ip)}"
-  local paths=($(routes_like 'node') /api/admin/nodes /api/nodes /api/admin/node) loc="" lp
-  for lp in $(routes_like 'location') /api/admin/locations /api/locations; do
-    if call GET "$lp"; then loc=$(echo "$RESP_BODY" | jq -r '(.[0] // .locations[0] // .data[0] // empty) | (.id // .uuid // empty)' 2>/dev/null || true); [[ -n $loc ]] && break; fi
-  done
+  node_cert
+  # lokasi
+  local loc=""
+  call GET /api/admin/locations && loc=$(echo "$RESP_BODY" | jq -r '.locations[0].id // empty')
   if [[ -z $loc ]]; then
-    for lp in /api/admin/locations /api/locations; do
-      if call POST "$lp" '{"name":"Default","short":"default","description":"Default"}'; then
-        loc=$(echo "$RESP_BODY" | jq -r '.id // .uuid // .location.id // .data.id // empty'); [[ -n $loc ]] && break; fi
-    done
+    call POST /api/admin/locations '{"location":{"short":"default","long":"Default Location"}}' || die "Gagal membuat location ($RESP_CODE): ${RESP_BODY:0:200}"
+    loc=$(echo "$RESP_BODY" | jq -r '.location.id // empty')
   fi
-  local trial m d o body
-  for trial in "0 0 -1" "999999999 999999999 0"; do
-    read -r m d o <<<"$trial"
-    body=$(jq -nc --arg n "$NODE_NAME" --arg f "$NODE_FQDN" --arg loc "$loc" \
-      --argjson m "$m" --argjson d "$d" --argjson o "$o" --argjson dp "$DAEMON_PORT" --argjson sp "$SFTP_PORT" \
-      '{name:$n,fqdn:$f,host:$f,address:$f,ip:$f,scheme:"http",port:$dp,daemonPort:$dp,daemonListen:$dp,daemonSftp:$sp,sftpPort:$sp,
-        memory:$m,disk:$d,memoryOverallocate:$o,diskOverallocate:$o,overallocate:$o,cpu:0,public:true,maintenanceMode:false,
-        locationId:(if $loc=="" then null else $loc end),location:(if $loc=="" then null else $loc end),location_id:(if $loc=="" then null else $loc end)}')
-    if first_ok POST "$body" "${paths[@]}"; then
-      NODES_PATH=${USED_PATH%/}
-      NODE_ID=$(echo "$RESP_BODY" | jq -r '.id // .uuid // .node.id // .data.id // .node.uuid // empty')
-      NODE_TOKEN=$(echo "$RESP_BODY" | jq -r '.token // .daemonToken // .daemon_token // .node.token // .data.token // empty')
-      NODE_RAW="$RESP_BODY"
-      [[ -n $NODE_ID ]] && { ok "Node ${B}$NODE_NAME${R} dibuat  ${MUT}id=$NODE_ID · RAM/Disk unlimited${R}"; return; }
-    fi
-  done
-  die "Gagal membuat node. Respons ($RESP_CODE): ${RESP_BODY:0:200}"
+  [[ -n $loc ]] || die "Location tidak ditemukan"
+  # panel membaca angka; 0 diganti default, jadi "unlimited" = angka sangat besar (+ overallocation 1000%)
+  local body
+  body=$(jq -nc --arg n "$NODE_NAME" --arg f "$NODE_FQDN" --arg loc "$loc" --arg sc "$NODE_SCHEME" \
+    --argjson dp "$DAEMON_PORT" --argjson sp "$SFTP_PORT" \
+    '{node:{name:$n,description:"Dibuat oleh sodium-installer",location_id:$loc,fqdn:$f,scheme:$sc,
+      memory:999999999,disk:999999999,memory_overallocation:1000,disk_overallocation:1000,
+      daemon_port:$dp,daemon_sftp_port:$sp,upload_size:1000,behind_proxy:false,
+      allocation_start:25565,allocation_end:26565}}')
+  call POST /api/admin/nodes "$body" || die "Gagal membuat node ($RESP_CODE): ${RESP_BODY:0:200}"
+  NODE_ID=$(echo "$RESP_BODY" | jq -r '.node.id // empty')
+  NODE_TOKEN=$(echo "$RESP_BODY" | jq -r '.node.daemon_token // empty')
+  NODE_TOKEN_ID=$(echo "$RESP_BODY" | jq -r '.node.daemon_token_id // empty')
+  [[ -n $NODE_ID && -n $NODE_TOKEN ]] || die "Respons node tidak lengkap: ${RESP_BODY:0:200}"
+  ok "Node ${B}$NODE_NAME${R} dibuat  ${MUT}$NODE_SCHEME://$NODE_FQDN:$DAEMON_PORT · RAM/Disk unlimited${R}"
 }
-fetch_daemon_config(){
-  mkdir -p /etc/sodium; local p
-  for p in config configuration config-yaml config.yml deploy; do
-    if call GET "$NODES_PATH/$NODE_ID/$p"; then printf '%s' "$RESP_BODY" > /etc/sodium/node-config.raw; ok "Config daemon diambil dari panel ${MUT}(/$p)${R}"; return 0; fi
-  done
-  if [[ -n $NODE_TOKEN ]]; then
-    jq -n --arg id "$NODE_ID" --arg t "$NODE_TOKEN" --arg u "$PANEL_PUBLIC" --argjson p "$DAEMON_PORT" --argjson s "$SFTP_PORT" \
-      '{uuid:$id,token:$t,panel:$u,remote:$u,api:{host:"0.0.0.0",port:$p},sftp:{port:$s}}' > /etc/sodium/node-config.raw
-    warn "Endpoint config tidak ada; memakai token dari pembuatan node"; return 0
-  fi
-  echo "$NODE_RAW" > /etc/sodium/node-config.raw; warn "Respons mentah disimpan di /etc/sodium/node-config.raw"
+
+daemon_install(){
+  local arch; arch=$(uname -m); [[ $arch == x86_64 ]] && arch=amd64 || arch=arm64
+  mkdir -p /etc/sodium
+  curl -fL --retry 3 -o /usr/local/bin/wings "https://github.com/sodiumpanel/reaction/releases/latest/download/wings_linux_$arch"
+  chmod +x /usr/local/bin/wings
 }
-daemon_fetch(){
-  clone "$DAEMON_REPO" "$DAEMON_DIR"; cd "$DAEMON_DIR"
-  if [[ -f go.mod ]]; then command -v go >/dev/null || do_go; go build -o reaction .
-  elif [[ -f package.json ]]; then npm install --no-audit --no-fund; npm run build || true
-  else echo "Struktur repo daemon tidak dikenali"; return 1; fi
-}
-daemon_service(){
-  local start raw=/etc/sodium/node-config.raw ext=yml t
-  if [[ -f $DAEMON_DIR/go.mod ]]; then start="$DAEMON_DIR/reaction"; else start="$(command -v npm) start"; fi
-  head -c1 "$raw" | grep -q '[{[]' && ext=json
-  if [[ $ext == json ]]; then jq . "$raw" > /etc/sodium/config.json 2>/dev/null || cp "$raw" /etc/sodium/config.json; else cp "$raw" /etc/sodium/config.yml; fi
-  for t in "$DAEMON_DIR/config.$ext" "$DAEMON_DIR/config/config.$ext" "/etc/sodium-reaction/config.$ext"; do
-    mkdir -p "$(dirname "$t")"; cp "/etc/sodium/config.$ext" "$t"; done
-  cat >/etc/systemd/system/sodium-reaction.service <<EOF
+
+daemon_config(){
+  local remote ssl=false cert="" key=""
+  if [[ $MODE == full ]]; then remote="http://127.0.0.1:$PANEL_PORT"; else remote="$PANEL_PUBLIC"; fi
+  if [[ $SSL_OK -eq 1 ]]; then ssl=true; cert="/etc/letsencrypt/live/$NODE_FQDN/fullchain.pem"; key="/etc/letsencrypt/live/$NODE_FQDN/privkey.pem"; fi
+  mkdir -p /etc/sodium /var/sodium
+  cat >/etc/sodium/config.yml <<EOF
+debug: false
+uuid: "$NODE_ID"
+token_id: "$NODE_TOKEN_ID"
+token: "$NODE_TOKEN"
+api:
+  host: "0.0.0.0"
+  port: $DAEMON_PORT
+  ssl:
+    enabled: $ssl
+    cert: "$cert"
+    key: "$key"
+  upload_limit: 1000
+system:
+  root_directory: "/var/sodium"
+  log_directory: "/var/sodium/logs"
+  data: "/var/sodium/volumes"
+  archive_directory: "/var/sodium/archives"
+  backup_directory: "/var/sodium/backups"
+  tmp_directory: "/tmp/sodium"
+  username: "sodium"
+  sftp:
+    bind_port: $SFTP_PORT
+docker:
+  network:
+    name: "sodium_nw"
+    interfaces:
+      v4:
+        subnet: "172.50.0.0/16"
+        gateway: "172.50.0.1"
+remote: "$remote"
+allowed_origins:
+  - "*"
+EOF
+  chmod 600 /etc/sodium/config.yml
+  cat >/etc/systemd/system/wings.service <<'EOF'
 [Unit]
 Description=Sodium Reaction Daemon
-After=network.target docker.service
+After=docker.service
 Requires=docker.service
+PartOf=docker.service
+
 [Service]
-WorkingDirectory=$DAEMON_DIR
-ExecStart=$start
-Restart=always
-RestartSec=3
-LimitNOFILE=4096000
+User=root
+WorkingDirectory=/etc/sodium
+LimitNOFILE=4096
+PIDFile=/var/run/wings/daemon.pid
+ExecStart=/usr/local/bin/wings --config /etc/sodium/config.yml
+Restart=on-failure
+StartLimitInterval=180
+StartLimitBurst=30
+RestartSec=5s
+
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload; systemctl enable --now sodium-reaction >>"$LOG" 2>&1
-  open_ports "$DAEMON_PORT" "$SFTP_PORT"
-  ok "Service systemd ${B}sodium-reaction${R} aktif"
+  systemctl daemon-reload; systemctl enable wings >>"$LOG" 2>&1; systemctl restart wings
+  open_ports "$DAEMON_PORT" "$SFTP_PORT" 25565:26565
+  ok "Config ${B}/etc/sodium/config.yml${R} ditulis & service ${B}wings${R} aktif"
 }
+
 node_green(){
-  call GET "$NODES_PATH/$NODE_ID" && echo "$RESP_BODY" | grep -qiE '"(online|connected|alive)"[[:space:]]*:[[:space:]]*true|"status"[[:space:]]*:[[:space:]]*"(online|connected|ready|running)"'
+  call GET /api/admin/nodes/health && echo "$RESP_BODY" | jq -e --arg id "$NODE_ID" '.health[$id].status | IN("online","degraded")' >/dev/null
 }
 wait_green(){
-  if poll "Menunggu node hijau (online)" 180 node_green; then NODE_STATE="${OK}● ONLINE (hijau)${R}"
-  else NODE_STATE="${WRN}● belum terdeteksi online${R}"
-    warn "Cek: journalctl -u sodium-reaction -n 50 --no-pager  · pastikan port $DAEMON_PORT terbuka dari panel"; fi
+  say "Panel mengecek node tiap 60 detik — bisa sampai ~1-2 menit."
+  if poll "Menunggu node hijau (online)" 240 node_green; then NODE_STATE="${OK}● ONLINE (hijau)${R}"
+  else NODE_STATE="${WRN}● belum online${R}"
+    warn "Cek: journalctl -u wings -n 50 --no-pager"
+    warn "Pastikan port $DAEMON_PORT terbuka (firewall provider/VPS) dari panel ke node."
+  fi
 }
 
 summary(){
   echo; local l=()
   if [[ $MODE == panel || $MODE == full ]]; then
-    l+=("Panel   : ${B}http://$(public_ip):$PANEL_PORT${R}" "Admin   : ${B}$ADMIN_USER${R}   Pass: ${B}$ADMIN_PASS${R}")
+    l+=("Panel   : ${B}$PANEL_PUBLIC${R}" "Admin   : ${B}$ADMIN_USER${R}   Pass: ${B}$ADMIN_PASS${R}")
   fi
-  [[ -n $NODE_ID ]] && l+=("Node    : ${B}$NODE_NAME${R} ($NODE_FQDN)" "Status  : ${NODE_STATE:-}" "Resource: RAM ∞  ·  Disk ∞")
+  [[ -n $NODE_ID ]] && l+=("Node    : ${B}$NODE_NAME${R}" "Alamat  : $NODE_SCHEME://$NODE_FQDN:$DAEMON_PORT" "Status  : $NODE_STATE" "Resource: RAM ∞  ·  Disk ∞")
   l+=("" "${MUT}Log     : $LOG${R}")
   [[ $MODE == panel || $MODE == full ]] && l+=("${MUT}Service : systemctl status sodium-panel${R}")
-  [[ -n $NODE_ID ]] && l+=("${MUT}Daemon  : systemctl status sodium-reaction${R}")
+  [[ -n $NODE_ID ]] && l+=("${MUT}Daemon  : systemctl status wings${R}")
   box "✔ INSTALASI SELESAI" "$OK" "${l[@]}"
-  [[ ${GEN_PASS:-0} == 1 ]] && echo -e "\n  ${WRN}Simpan password admin di atas — dibuat acak dan hanya tampil sekali.${R}"
+  [[ $GEN_PASS == 1 ]] && echo -e "\n  ${WRN}Simpan password admin di atas — dibuat acak dan hanya tampil sekali.${R}"
+  [[ $NODE_SCHEME == http && $PANEL_PUBLIC == https://* ]] && echo -e "  ${WRN}Panel HTTPS tapi node HTTP: console/upload di browser bisa diblokir (mixed content). Pakai domain node + SSL.${R}"
   echo
 }
 
@@ -445,6 +535,7 @@ esac
 if [[ $MODE == node || $MODE == addnode ]]; then
   [[ -n $PANEL_URL ]] || { [[ $MODE == node ]] && PANEL_URL="http://127.0.0.1:$PANEL_PORT" || die "Butuh --panel-url"; }
   [[ -n $ADMIN_PASS ]] || die "Butuh --admin-pass"
+  PANEL_PUBLIC="$PANEL_URL"
 fi
 box "Mode: $MODE" "$MUT" "Host : $(hostname)   IP: $(public_ip)" "OS   : $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-linux}")"
 detect_pm
@@ -456,23 +547,21 @@ if have_node; then ok "Node.js $(node -v) sudah ada"; else run "Memasang Node.js
 if [[ $MODE == full || $MODE == panel ]]; then
   step "Mengunduh & build Sodium Panel"
   run "Clone + npm install + build panel" panel_fetch
-  discover_routes
-  step "Menjalankan panel"
+  step "Menjalankan panel & domain"
   panel_start
+  panel_domain_setup
   step "Setup admin panel"
   setup_panel_admin
 fi
-if [[ $MODE == full ]]; then PANEL_PUBLIC="http://$(public_ip):$PANEL_PORT"; fi
-if [[ $MODE == node || $MODE == addnode ]]; then PANEL_PUBLIC="$PANEL_URL"; fi
 
 if [[ $MODE != panel ]]; then
   step "Login & membuat node"
   panel_login; create_node
   step "Memasang daemon (Docker + Sodium Reaction)"
   if command -v docker >/dev/null; then ok "Docker sudah ada"; else run "Memasang Docker" do_docker; fi
-  run "Clone + build Sodium Reaction" daemon_fetch
+  run "Mengunduh binary Sodium Reaction" daemon_install
   step "Konfigurasi & start daemon"
-  fetch_daemon_config; daemon_service
+  daemon_config
   step "Verifikasi node hijau"
   wait_green
 fi
